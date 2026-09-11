@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Real flight data and local reference data must not be published.
+data/
+reg.xlsx
+
+# Generated workbooks and logs.
+result/
+
+# Historical experiments are not part of the maintained application.
+中队译码_old/
+
+# Editor and OS files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
