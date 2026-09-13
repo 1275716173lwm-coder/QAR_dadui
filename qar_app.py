@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from qar_analyzer import AnalysisResult, LogRecord, ProgressEvent, analyze_selected_folder
-from qar_output import OutputError, write_log, write_workbook
+from qar_output import OutputError, write_docx_report, write_log, write_workbook
 
 
 @dataclass
@@ -21,8 +22,13 @@ class WorkerMessage:
 class QarApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.base_dir = Path(__file__).resolve().parent
-        self.template_path = self.base_dir / "result_sample" / "result_sample.xlsx"
+        if getattr(sys, "frozen", False):
+            resource_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+            self.base_dir = Path(sys.executable).resolve().parent
+        else:
+            resource_dir = Path(__file__).resolve().parent
+            self.base_dir = resource_dir
+        self.template_path = resource_dir / "result_sample" / "result_sample.xlsx"
         self.output_dir = self.base_dir / "result"
         self.messages: queue.Queue[WorkerMessage] = queue.Queue()
         self.cancel_event = threading.Event()
@@ -137,25 +143,75 @@ class QarApp:
         try:
             result = analyze_selected_folder(selected_folder, self.cancel_event, self._progress_callback)
             workbook_path: Path | None = None
-            output_error: str | None = None
+            report_path: Path | None = None
+            output_errors: list[str] = []
             if not result.cancelled:
                 try:
                     workbook_path = write_workbook(self.template_path, self.output_dir, result.summaries)
                 except OutputError as exc:
-                    output_error = str(exc)
+                    output_errors.append(f"Excel结果文件：{exc}")
                     result.log_records.append(
                         LogRecord(
                             record_type="OUTPUT", timestamp=datetime.now(), status="FAILED",
-                            error_code="WORKBOOK_OUTPUT_ERROR", message=output_error,
+                            metric="Excel结果文件", error_code="WORKBOOK_OUTPUT_ERROR",
+                            message=str(exc),
                         )
                     )
+                else:
+                    result.log_records.append(
+                        LogRecord(
+                            record_type="OUTPUT", timestamp=datetime.now(), status="SUCCESS",
+                            metric="Excel结果文件", message=f"已生成：{workbook_path}",
+                            excel_file=str(workbook_path),
+                        )
+                    )
+
+                try:
+                    report_path = write_docx_report(self.output_dir, result)
+                except OutputError as exc:
+                    output_errors.append(f"DOCX报告：{exc}")
+                    result.log_records.append(
+                        LogRecord(
+                            record_type="OUTPUT", timestamp=datetime.now(), status="FAILED",
+                            metric="DOCX报告", error_code="DOCX_OUTPUT_ERROR",
+                            message=str(exc), excel_file=str(workbook_path or ""),
+                            docx_status="FAILED",
+                        )
+                    )
+                else:
+                    result.log_records.append(
+                        LogRecord(
+                            record_type="OUTPUT", timestamp=datetime.now(), status="SUCCESS",
+                            metric="DOCX报告", message=f"已生成：{report_path}",
+                            excel_file=str(workbook_path or ""),
+                            docx_status="SUCCESS",
+                        )
+                    )
+
+                result.ended_at = datetime.now()
+                run_status = "COMPLETED_WITH_OUTPUT_ERRORS" if output_errors else "COMPLETED"
+                run_message = (
+                    "分析完成，但部分输出失败：" + "；".join(output_errors)
+                    if output_errors
+                    else "分析及输出完成"
+                )
+                result.log_records.append(
+                    LogRecord(
+                        record_type="RUN", timestamp=result.ended_at, status=run_status,
+                        message=run_message, excel_file=str(workbook_path or ""),
+                        docx_status="SUCCESS" if report_path else "FAILED",
+                    )
+                )
             log_path = write_log(self.output_dir, result)
             if result.cancelled:
                 self.messages.put(WorkerMessage("cancelled", (result, log_path)))
-            elif output_error:
-                self.messages.put(WorkerMessage("error", (output_error, log_path)))
             else:
-                self.messages.put(WorkerMessage("done", (result, workbook_path, log_path)))
+                self.messages.put(
+                    WorkerMessage(
+                        "finished",
+                        (result, workbook_path, report_path, log_path, output_errors),
+                    )
+                )
         except Exception as exc:
             now = datetime.now()
             message = f"程序发生未处理错误：{type(exc).__name__}: {exc}"
@@ -211,31 +267,40 @@ class QarApp:
                 message = self.messages.get_nowait()
                 if message.kind == "progress":
                     self._handle_progress(message.payload)  # type: ignore[arg-type]
-                elif message.kind == "done":
-                    result, workbook_path, log_path = message.payload  # type: ignore[misc]
+                elif message.kind == "finished":
+                    result, workbook_path, report_path, log_path, output_errors = message.payload  # type: ignore[misc]
                     self.progress.configure(value=max(self.progress["maximum"], 1))
-                    text = f"分析完成。\n结果表：{workbook_path}\n日志：{log_path}"
-                    self.status_var.set("分析完成")
+                    lines = ["分析完成。"]
+                    lines.append(
+                        f"Excel结果：{workbook_path}"
+                        if workbook_path
+                        else "Excel结果：生成失败"
+                    )
+                    lines.append(
+                        f"DOCX报告：{report_path}"
+                        if report_path
+                        else "DOCX报告：生成失败"
+                    )
+                    lines.append(f"日志：{log_path}")
+                    if output_errors:
+                        lines.append("输出错误：" + "；".join(output_errors))
+                    text = "\n".join(lines)
+                    self.status_var.set("分析完成，部分输出失败" if output_errors else "分析完成")
                     self._append_status(text.replace("\n", "；"))
                     self._finish_ui()
                     if not self.close_requested:
-                        messagebox.showinfo("分析完成", text)
+                        if output_errors:
+                            messagebox.showwarning("分析完成，部分输出失败", text)
+                        else:
+                            messagebox.showinfo("分析完成", text)
                 elif message.kind == "cancelled":
                     _, log_path = message.payload  # type: ignore[misc]
-                    text = f"分析已取消，原结果表未被替换。\n日志：{log_path}"
+                    text = f"分析已取消，未生成新的Excel结果文件或DOCX报告。\n日志：{log_path}"
                     self.status_var.set("分析已取消")
                     self._append_status(text.replace("\n", "；"))
                     self._finish_ui()
                     if not self.close_requested:
                         messagebox.showinfo("已取消", text)
-                elif message.kind == "error":
-                    error_text, log_path = message.payload  # type: ignore[misc]
-                    text = f"分析已完成，但结果表保存失败：\n{error_text}\n日志：{log_path}"
-                    self.status_var.set("结果表保存失败")
-                    self._append_status(text.replace("\n", "；"))
-                    self._finish_ui()
-                    if not self.close_requested:
-                        messagebox.showerror("保存失败", text)
                 elif message.kind == "fatal":
                     text = str(message.payload)
                     self.status_var.set("分析失败")

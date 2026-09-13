@@ -34,6 +34,8 @@ class AircraftConfig:
     takeoff_min_2: int
     pitch_rate_cols: tuple[int, int]
     baro_altitude_col: int
+    wind_speed_col: int
+    wind_direction_col: int
 
 
 @dataclass
@@ -51,7 +53,20 @@ class FlightResult:
     path: Path
     aircraft_type: AircraftType
     flight_time: datetime | None
+    flight_number: str | None
     metrics: dict[str, MetricResult]
+    crosswind_metric: MetricResult
+    touchdown_row: int | None = None
+    takeoff_row: int | None = None
+    angle_difference: float | None = None
+    max_pitch_rate: float | None = None
+    baro_altitude: float | None = None
+    runway_heading: float | None = None
+    wind_speed: float | None = None
+    wind_direction: float | None = None
+    crosswind: float | None = None
+    wind_source_row: int | None = None
+    wind_row_offset: int | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -92,6 +107,11 @@ class LogRecord:
     valid: str = ""
     triggered: str = ""
     failed: str = ""
+    excel_file: str = ""
+    docx_status: str = ""
+    wind_source_row: str = ""
+    wind_row_offset: str = ""
+    crosswind: str = ""
 
 
 @dataclass
@@ -135,6 +155,8 @@ CONFIGS: dict[AircraftType, AircraftConfig] = {
         takeoff_min_2=2,
         pitch_rate_cols=(_column_number("BL"), _column_number("BO")),
         baro_altitude_col=_column_number("BK"),
+        wind_speed_col=_column_number("BI"),
+        wind_direction_col=_column_number("BJ"),
     ),
     AircraftType.LEAP: AircraftConfig(
         marker="YZDLEAP",
@@ -148,6 +170,8 @@ CONFIGS: dict[AircraftType, AircraftConfig] = {
         takeoff_min_2=1,
         pitch_rate_cols=(_column_number("BB"), _column_number("BE")),
         baro_altitude_col=_column_number("BA"),
+        wind_speed_col=_column_number("AY"),
+        wind_direction_col=_column_number("AZ"),
     ),
     AircraftType.PW: AircraftConfig(
         marker="YZDPW",
@@ -161,6 +185,8 @@ CONFIGS: dict[AircraftType, AircraftConfig] = {
         takeoff_min_2=2,
         pitch_rate_cols=(_column_number("BD"), _column_number("BG")),
         baro_altitude_col=_column_number("BC"),
+        wind_speed_col=_column_number("BA"),
+        wind_direction_col=_column_number("BB"),
     ),
 }
 
@@ -171,17 +197,29 @@ METRIC_LABELS = {
     "high_altitude": "高高原抬头速率",
 }
 
-_TIME_PATTERN = re.compile(r"_(\d{14})_")
+_TIME_PATTERN = re.compile(r"(?<!\d)(\d{14})(?!\d)")
+_FLIGHT_NUMBER_PATTERN = re.compile(r"CA\d+", re.IGNORECASE)
 
 
 def parse_flight_time(name: str) -> datetime | None:
-    match = _TIME_PATTERN.search(name)
-    if not match:
-        return None
-    try:
-        return datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
+    for match in _TIME_PATTERN.finditer(name):
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+    return None
+
+
+def parse_flight_number(name: str, aircraft_type: AircraftType | None = None) -> str | None:
+    upper_name = name.upper()
+    if aircraft_type is not None:
+        marker_index = upper_name.find(CONFIGS[aircraft_type].marker)
+        if marker_index >= 0:
+            match = _FLIGHT_NUMBER_PATTERN.search(name, marker_index + len(CONFIGS[aircraft_type].marker))
+            if match:
+                return match.group(0).upper()
+    match = _FLIGHT_NUMBER_PATTERN.search(name)
+    return match.group(0).upper() if match else None
 
 
 def identify_aircraft(name: str) -> AircraftType | None:
@@ -252,9 +290,25 @@ def _select_encoding(path: Path, cancel_event: threading.Event) -> str:
 
 def _failed_metrics(code: str, message: str) -> dict[str, MetricResult]:
     return {
-        key: MetricResult(False, error_code=code, error_message=message)
-        for key in METRIC_LABELS
+        "stick": MetricResult(False, error_code=code, error_message=message),
+        "cross_angle": MetricResult(False, error_code=code, error_message=message),
+        "pitch_rate": MetricResult(False, error_code=code, error_message=message),
+        "high_altitude": MetricResult(
+            True,
+            value=None,
+            error_code="NOT_APPLICABLE",
+            error_message="抬头速率是否超限无法确定",
+            applicable=False,
+        ),
     }
+
+
+def calculate_crosswind(wind_speed: float, wind_direction: float, runway_heading: float) -> float:
+    """Calculate crosswind in kt; negative is from the left and positive is from the right."""
+    normalized_direction = wind_direction % 360
+    normalized_runway = runway_heading % 360
+    value = wind_speed * math.sin(math.radians(normalized_direction - normalized_runway))
+    return 0.0 if abs(value) < 1e-12 else value
 
 
 def analyze_flight(
@@ -264,16 +318,28 @@ def analyze_flight(
     cancel_event: threading.Event,
 ) -> FlightResult:
     config = CONFIGS[aircraft_type]
+    flight_time = parse_flight_time(path.name)
+    flight_number = parse_flight_number(path.name, aircraft_type)
     warnings: list[str] = []
     expected_width: int | None = None
     short_rows = 0
     long_rows = 0
 
     seen_above_2000 = False
-    approach_rows: list[tuple[float | None, list[float | None], float | None, float | None]] = []
-    touchdown_found = False
+    approach_rows: list[
+        tuple[int, int, float | None, list[float | None], float | None, float | None]
+    ] = []
+    touchdown_data_index: int | None = None
+    touchdown_csv_row: int | None = None
+    touchdown_aircraft_heading: float | None = None
+    touchdown_runway_heading: float | None = None
+    last_runway_heading: float | None = None
+    last_wind_at_or_before: tuple[int, int, float, float] | None = None
+    first_wind_after: tuple[int, int, float, float] | None = None
+    landing_needs_wind = False
 
-    takeoff_row: int | None = None
+    takeoff_data_index: int | None = None
+    takeoff_csv_row: int | None = None
     previous_pitch_rates: list[float | None] | None = None
     pitch_window: list[float | None] = []
     pitch_rows_remaining = 0
@@ -297,6 +363,7 @@ def analyze_flight(
                 raise ValueError("CSV表头为空")
 
             for data_index, row in enumerate(reader):
+                csv_row = data_index + 3
                 if data_index % 250 == 0 and cancel_event.is_set():
                     raise AnalysisCancelled
 
@@ -305,30 +372,71 @@ def analyze_flight(
                 elif len(row) > expected_width:
                     long_rows += 1
 
+                runway_value = _finite_number(_cell(row, config.runway_heading_col))
+                if touchdown_data_index is None and runway_value is not None:
+                    last_runway_heading = runway_value
+
+                wind_speed_value = _finite_number(_cell(row, config.wind_speed_col))
+                wind_direction_value = _finite_number(_cell(row, config.wind_direction_col))
+                wind_pair_valid = (
+                    wind_speed_value is not None
+                    and wind_speed_value >= 0
+                    and wind_direction_value is not None
+                )
+                if wind_pair_valid:
+                    pair = (data_index, csv_row, float(wind_speed_value), float(wind_direction_value))
+                    if touchdown_data_index is None:
+                        last_wind_at_or_before = pair
+                    elif data_index > touchdown_data_index and first_wind_after is None:
+                        first_wind_after = pair
+
                 radio_height = _finite_number(_cell(row, config.altitude_col))
                 if not seen_above_2000 and radio_height is not None and radio_height > 2000:
                     seen_above_2000 = True
 
-                if seen_above_2000 and not touchdown_found:
+                if seen_above_2000 and touchdown_data_index is None:
+                    aircraft_heading = _finite_number(_cell(row, config.aircraft_heading_col))
                     approach_rows.append(
                         (
+                            data_index,
+                            csv_row,
                             radio_height,
                             _numbers(row, *config.stick_cols),
-                            _finite_number(_cell(row, config.aircraft_heading_col)),
-                            _finite_number(_cell(row, config.runway_heading_col)),
+                            aircraft_heading,
+                            runway_value,
                         )
                     )
                     if radio_height is not None and radio_height < 0:
-                        touchdown_found = True
+                        touchdown_data_index = data_index
+                        touchdown_csv_row = csv_row
+                        touchdown_aircraft_heading = aircraft_heading
+                        touchdown_runway_heading = runway_value if runway_value is not None else last_runway_heading
+                        if (
+                            touchdown_aircraft_heading is not None
+                            and touchdown_runway_heading is not None
+                        ):
+                            touchdown_angle = abs(
+                                (
+                                    (
+                                        touchdown_aircraft_heading
+                                        - touchdown_runway_heading
+                                        + 180
+                                    )
+                                    % 360
+                                )
+                                - 180
+                            )
+                            landing_needs_wind = touchdown_angle > 6
 
                 current_pitch_rates = _numbers(row, *config.pitch_rate_cols)
-                if takeoff_row is None:
+                if takeoff_data_index is None:
                     group_1 = _numbers(row, *config.takeoff_group_1)
                     group_2 = _numbers(row, *config.takeoff_group_2)
                     count_1 = sum(value is not None and value > 2 for value in group_1)
                     count_2 = sum(value is not None and value > 2 for value in group_2)
                     if count_1 >= config.takeoff_min_1 and count_2 >= config.takeoff_min_2:
-                        takeoff_row = data_index
+                        takeoff_data_index = data_index
+                        takeoff_csv_row = csv_row
                         if previous_pitch_rates is not None:
                             pitch_window.extend(previous_pitch_rates)
                         pitch_window.extend(current_pitch_rates)
@@ -340,7 +448,23 @@ def analyze_flight(
                     pitch_window.extend(current_pitch_rates)
                     pitch_rows_remaining -= 1
 
-                if touchdown_found and takeoff_row is not None and pitch_rows_remaining == 0:
+                wind_search_complete = (
+                    touchdown_data_index is not None
+                    and (
+                        not landing_needs_wind
+                        or (
+                            last_wind_at_or_before is not None
+                            and last_wind_at_or_before[0] == touchdown_data_index
+                        )
+                        or first_wind_after is not None
+                    )
+                )
+                if (
+                    touchdown_data_index is not None
+                    and takeoff_data_index is not None
+                    and pitch_rows_remaining == 0
+                    and wind_search_complete
+                ):
                     break
     except AnalysisCancelled:
         raise
@@ -350,8 +474,16 @@ def analyze_flight(
             person=person,
             path=path,
             aircraft_type=aircraft_type,
-            flight_time=parse_flight_time(path.name),
+            flight_time=flight_time,
+            flight_number=flight_number,
             metrics=_failed_metrics("CSV_READ_ERROR", message),
+            crosswind_metric=MetricResult(
+                True,
+                value=None,
+                error_code="NOT_APPLICABLE",
+                error_message="未确认接地交叉角超限",
+                applicable=False,
+            ),
             warnings=warnings,
         )
 
@@ -363,22 +495,23 @@ def analyze_flight(
     metrics: dict[str, MetricResult] = {}
     if not seen_above_2000:
         landing_error = ("NO_ABOVE_2000", "D列未找到大于2000的有效高度")
-    elif not touchdown_found:
+    elif touchdown_data_index is None:
         landing_error = ("NO_TOUCHDOWN", "从首次大于2000后未找到D列首次负值")
     else:
         landing_error = None
 
+    angle_difference: float | None = None
     if landing_error:
         metrics["stick"] = MetricResult(False, error_code=landing_error[0], error_message=landing_error[1])
         metrics["cross_angle"] = MetricResult(False, error_code=landing_error[0], error_message=landing_error[1])
     else:
         nearest_index = min(
-            (index for index, item in enumerate(approach_rows) if item[0] is not None),
-            key=lambda index: abs(float(approach_rows[index][0]) - 300),
+            (index for index, item in enumerate(approach_rows) if item[2] is not None),
+            key=lambda index: abs(float(approach_rows[index][2]) - 300),
         )
         stick_values = [
             value
-            for _, row_values, _, _ in approach_rows[nearest_index:]
+            for _, _, _, row_values, _, _ in approach_rows[nearest_index:]
             for value in row_values
             if value is not None
         ]
@@ -392,26 +525,22 @@ def analyze_flight(
                 error_message="300ft至接地区域没有有效杆量采样点",
             )
 
-        aircraft_heading = approach_rows[-1][2]
-        runway_heading = approach_rows[-1][3]
-        if runway_heading is None:
-            runway_heading = next(
-                (item[3] for item in reversed(approach_rows[:-1]) if item[3] is not None),
-                None,
-            )
-        if aircraft_heading is None:
+        if touchdown_aircraft_heading is None:
             metrics["cross_angle"] = MetricResult(
                 False, error_code="NO_AIRCRAFT_HEADING", error_message="接地行飞机磁航向无有效值"
             )
-        elif runway_heading is None:
+        elif touchdown_runway_heading is None:
             metrics["cross_angle"] = MetricResult(
                 False, error_code="NO_RUNWAY_HEADING", error_message="接地行及其上方没有有效跑道磁航向"
             )
         else:
-            angle_difference = abs(((aircraft_heading - runway_heading + 180) % 360) - 180)
+            angle_difference = abs(
+                ((touchdown_aircraft_heading - touchdown_runway_heading + 180) % 360) - 180
+            )
             metrics["cross_angle"] = MetricResult(True, angle_difference > 6)
 
-    if takeoff_row is None:
+    max_pitch_rate: float | None = None
+    if takeoff_data_index is None:
         metrics["pitch_rate"] = MetricResult(
             False, error_code="NO_TAKEOFF_ROW", error_message="未找到满足条件的首次离地行"
         )
@@ -422,7 +551,8 @@ def analyze_flight(
                 False, error_code="NO_PITCH_RATE_VALUES", error_message="离地行前1至后2行没有有效抬头速率"
             )
         else:
-            metrics["pitch_rate"] = MetricResult(True, max(valid_pitch_rates) > 3.5)
+            max_pitch_rate = max(valid_pitch_rates)
+            metrics["pitch_rate"] = MetricResult(True, max_pitch_rate > 3.5)
 
     pitch_metric = metrics["pitch_rate"]
     if pitch_metric.success and pitch_metric.value is True:
@@ -441,12 +571,77 @@ def analyze_flight(
             applicable=False,
         )
 
+    selected_wind: tuple[int, int, float, float] | None = None
+    wind_speed: float | None = None
+    wind_direction: float | None = None
+    crosswind: float | None = None
+    wind_source_row: int | None = None
+    wind_row_offset: int | None = None
+    cross_metric = metrics["cross_angle"]
+    if cross_metric.success and cross_metric.value is True:
+        candidates = [
+            candidate
+            for candidate in (last_wind_at_or_before, first_wind_after)
+            if candidate is not None
+        ]
+        if touchdown_data_index is not None and candidates:
+            selected_wind = min(
+                candidates,
+                key=lambda item: (
+                    abs(item[0] - touchdown_data_index),
+                    0 if item[0] <= touchdown_data_index else 1,
+                ),
+            )
+        if selected_wind is None:
+            crosswind_metric = MetricResult(
+                False,
+                error_code="NO_WIND_PAIR",
+                error_message="CSV全部数据行均未找到同一行有效的风速和风向",
+            )
+        elif touchdown_runway_heading is None:
+            crosswind_metric = MetricResult(
+                False,
+                error_code="NO_RUNWAY_HEADING",
+                error_message="无法取得有效着陆跑道磁航向",
+            )
+        else:
+            wind_data_index, wind_source_row, wind_speed, raw_wind_direction = selected_wind
+            wind_direction = raw_wind_direction % 360
+            wind_row_offset = wind_data_index - touchdown_data_index
+            crosswind = calculate_crosswind(
+                wind_speed,
+                wind_direction,
+                touchdown_runway_heading,
+            )
+            crosswind_metric = MetricResult(True, crosswind)
+    else:
+        crosswind_metric = MetricResult(
+            True,
+            value=None,
+            error_code="NOT_APPLICABLE",
+            error_message="接地交叉角未超限或交叉角指标失败",
+            applicable=False,
+        )
+
     return FlightResult(
         person=person,
         path=path,
         aircraft_type=aircraft_type,
-        flight_time=parse_flight_time(path.name),
+        flight_time=flight_time,
+        flight_number=flight_number,
         metrics=metrics,
+        crosswind_metric=crosswind_metric,
+        touchdown_row=touchdown_csv_row,
+        takeoff_row=takeoff_csv_row,
+        angle_difference=angle_difference,
+        max_pitch_rate=max_pitch_rate,
+        baro_altitude=takeoff_baro,
+        runway_heading=touchdown_runway_heading,
+        wind_speed=wind_speed,
+        wind_direction=wind_direction,
+        crosswind=crosswind,
+        wind_source_row=wind_source_row,
+        wind_row_offset=wind_row_offset,
         warnings=warnings,
     )
 
@@ -512,6 +707,12 @@ def _metric_log_record(flight: FlightResult, key: str, metric: MetricResult) -> 
     value = ""
     if metric.value is not None:
         value = str(metric.value)
+    if metric.success and key == "cross_angle" and flight.angle_difference is not None:
+        value = f"触发={bool(metric.value)}；实际交叉角={flight.angle_difference:.2f}°"
+    elif metric.success and key == "pitch_rate" and flight.max_pitch_rate is not None:
+        value = f"触发={bool(metric.value)}；最大抬头速率={flight.max_pitch_rate:.2f}°/s"
+    elif metric.success and key == "high_altitude" and flight.baro_altitude is not None:
+        value = f"高高原={bool(metric.value)}；气压高度={flight.baro_altitude:.2f} ft"
     message = metric.error_message
     if value:
         message = f"值={value}" + (f"；{message}" if message else "")
@@ -525,6 +726,39 @@ def _metric_log_record(flight: FlightResult, key: str, metric: MetricResult) -> 
         status=status,
         error_code=metric.error_code,
         message=message,
+    )
+
+
+def _crosswind_log_record(flight: FlightResult) -> LogRecord:
+    metric = flight.crosswind_metric
+    if not metric.applicable:
+        status = "NOT_APPLICABLE"
+    else:
+        status = "SUCCESS" if metric.success else "FAILED"
+    message = metric.error_message
+    if metric.success and metric.value is not None:
+        message = f"侧风分量={float(metric.value):.2f} kt"
+    return LogRecord(
+        record_type="DETAIL",
+        timestamp=datetime.now(),
+        person=flight.person,
+        file_path=str(flight.path),
+        aircraft_type=flight.aircraft_type.value,
+        metric="侧风分量",
+        status=status,
+        error_code=metric.error_code,
+        message=message,
+        wind_source_row=str(flight.wind_source_row or ""),
+        wind_row_offset=(
+            str(flight.wind_row_offset)
+            if flight.wind_row_offset is not None
+            else ""
+        ),
+        crosswind=(
+            f"{flight.crosswind:.2f}"
+            if flight.crosswind is not None
+            else ""
+        ),
     )
 
 
@@ -583,6 +817,35 @@ def analyze_selected_folder(
             all_flights.append(flight)
             for key, metric in flight.metrics.items():
                 log_records.append(_metric_log_record(flight, key, metric))
+            log_records.append(_crosswind_log_record(flight))
+            if flight.flight_time is None:
+                log_records.append(
+                    LogRecord(
+                        record_type="WARNING",
+                        timestamp=datetime.now(),
+                        person=flight.person,
+                        file_path=str(flight.path),
+                        aircraft_type=flight.aircraft_type.value,
+                        metric="航段日期时间",
+                        status="WARNING",
+                        error_code="FLIGHT_TIME_PARSE_ERROR",
+                        message="无法从文件名解析合法的14位航段日期时间，报告显示“无法解析”",
+                    )
+                )
+            if flight.flight_number is None:
+                log_records.append(
+                    LogRecord(
+                        record_type="WARNING",
+                        timestamp=datetime.now(),
+                        person=flight.person,
+                        file_path=str(flight.path),
+                        aircraft_type=flight.aircraft_type.value,
+                        metric="航班号",
+                        status="WARNING",
+                        error_code="FLIGHT_NUMBER_PARSE_ERROR",
+                        message="无法从文件名解析CA后跟数字的航班号，报告显示“无法解析”",
+                    )
+                )
             for warning in flight.warnings:
                 log_records.append(
                     LogRecord(
@@ -616,14 +879,14 @@ def analyze_selected_folder(
     failed_count = sum(1 for record in log_records if record.status == "FAILED")
     if cancelled:
         status = "CANCELLED"
-        message = "用户取消分析，未生成或替换结果表"
+        message = "用户取消分析，未生成新的Excel结果文件或DOCX报告"
     elif failed_count:
         status = "COMPLETED_WITH_ERRORS"
         message = f"分析完成，共记录{failed_count}项失败"
     else:
         status = "COMPLETED"
         message = "分析完成，未发现错误"
-    log_records.append(LogRecord(record_type="RUN", timestamp=ended_at, status=status, message=message))
+    log_records.append(LogRecord(record_type="ANALYSIS", timestamp=ended_at, status=status, message=message))
     callback(
         ProgressEvent(
             "cancelled" if cancelled else "analyzed",

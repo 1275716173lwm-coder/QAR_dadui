@@ -19,3 +19,8 @@ result/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# PyInstaller output.
+build/
+dist/
+*.spec
