@@ -27,6 +27,8 @@ LOG_HEADERS = [
     "记录类型", "时间", "人员", "文件完整路径", "机型", "指标", "状态", "错误代码",
     "说明", "候选文件数", "有效文件数", "触发文件数", "失败文件数",
     "Excel结果文件", "DOCX状态", "风数据来源行", "风数据行差", "侧风分量kt",
+    "带方向接地交叉角", "交叉方向", "反向蹬舵代表值", "代表值CSV行",
+    "50ft行", "接地行", "反向蹬舵触发",
 ]
 
 WORKBOOK_HEADERS = [
@@ -41,6 +43,7 @@ WORKBOOK_HEADERS = [
     "PF 抬头速率大于 3.5°/s 占比",
     "抬头速率大中高高原次数",
     "抬头速率大中高高原占比",
+    "疑似接地前反向蹬舵次数",
 ]
 
 
@@ -109,6 +112,13 @@ def write_log(output_dir: Path, result: AnalysisResult, extra_records: list[LogR
                 record.wind_source_row,
                 record.wind_row_offset,
                 record.crosswind,
+                record.signed_angle,
+                record.cross_direction,
+                record.reverse_rudder_value,
+                record.reverse_rudder_row,
+                record.fifty_ft_row,
+                record.touchdown_row,
+                record.reverse_rudder_triggered,
             ]
             handle.write("\t".join(_safe_text(value) for value in row) + "\n")
     return path
@@ -119,18 +129,19 @@ def _write_summary_row(sheet, row: int, summary: PersonSummary) -> None:
         summary.person,
         summary.stick_exceed_count,
         summary.stick_exceed_ratio,
-        None,
-        None,
+        summary.rudder_exceed_count,
+        summary.rudder_exceed_ratio,
         summary.cross_angle_count,
         summary.cross_angle_ratio,
         summary.pitch_rate_count,
         summary.pitch_rate_ratio,
         summary.high_altitude_count,
         summary.high_altitude_ratio,
+        summary.reverse_rudder_count,
     ]
     for column, value in enumerate(values, start=1):
         sheet.cell(row=row, column=column, value=value)
-    for column in (3, 7, 9, 11):
+    for column in (3, 5, 7, 9, 11):
         sheet.cell(row=row, column=column).number_format = "0.00%"
 
 
@@ -146,8 +157,8 @@ def write_workbook(template_path: Path, output_dir: Path, summaries: list[Person
         if not workbook.worksheets:
             raise OutputError("结果模板不包含工作表")
         sheet = workbook.worksheets[0]
-        if sheet.max_column < 11:
-            raise OutputError(f"结果模板至少需要11列，当前只有{sheet.max_column}列")
+        if sheet.max_column < 12:
+            raise OutputError(f"结果模板至少需要12列，当前只有{sheet.max_column}列")
         if sheet.max_row > 1:
             sheet.delete_rows(2, sheet.max_row - 1)
         for column, header in enumerate(WORKBOOK_HEADERS, start=1):
@@ -169,8 +180,8 @@ def write_workbook(template_path: Path, output_dir: Path, summaries: list[Person
             if not validation_workbook.worksheets:
                 raise OutputError("临时结果工作簿校验失败：没有工作表")
             validation_sheet = validation_workbook.worksheets[0]
-            if validation_sheet.max_column < 11:
-                raise OutputError("临时结果工作簿校验失败：列数不足11列")
+            if validation_sheet.max_column < 12:
+                raise OutputError("临时结果工作簿校验失败：列数不足12列")
         finally:
             validation_workbook.close()
 
@@ -333,14 +344,15 @@ def _summary_rows(summary: PersonSummary) -> list[tuple[str, str]]:
         (WORKBOOK_HEADERS[0], summary.person),
         (WORKBOOK_HEADERS[1], str(summary.stick_exceed_count)),
         (WORKBOOK_HEADERS[2], _format_ratio(summary.stick_exceed_ratio)),
-        (WORKBOOK_HEADERS[3], "暂未分析"),
-        (WORKBOOK_HEADERS[4], "暂未分析"),
+        (WORKBOOK_HEADERS[3], str(summary.rudder_exceed_count)),
+        (WORKBOOK_HEADERS[4], _format_ratio(summary.rudder_exceed_ratio)),
         (WORKBOOK_HEADERS[5], str(summary.cross_angle_count)),
         (WORKBOOK_HEADERS[6], _format_ratio(summary.cross_angle_ratio)),
         (WORKBOOK_HEADERS[7], str(summary.pitch_rate_count)),
         (WORKBOOK_HEADERS[8], _format_ratio(summary.pitch_rate_ratio)),
         (WORKBOOK_HEADERS[9], str(summary.high_altitude_count)),
         (WORKBOOK_HEADERS[10], _format_ratio(summary.high_altitude_ratio)),
+        (WORKBOOK_HEADERS[11], str(summary.reverse_rudder_count)),
     ]
 
 
@@ -351,6 +363,12 @@ def _add_labeled_paragraph(document: Document, label: str, value: str) -> None:
     _set_font(label_run, "Microsoft YaHei", 10.5, bold=True)
     value_run = paragraph.add_run(value)
     _set_font(value_run, "Microsoft YaHei", 10.5)
+
+
+def _keep_event_block_together(document: Document, start_index: int) -> None:
+    paragraphs = document.paragraphs[start_index:]
+    for paragraph in paragraphs[:-1]:
+        paragraph.paragraph_format.keep_with_next = True
 
 
 def _display_time(flight: FlightResult) -> str:
@@ -384,6 +402,7 @@ def _add_cross_angle_events(document: Document, flights: list[FlightResult]) -> 
         return
 
     for event_index, flight in enumerate(events, start=1):
+        start_index = len(document.paragraphs)
         document.add_heading(f"事件 {event_index}", level=3)
         _add_labeled_paragraph(document, "航段日期时间", _display_time(flight))
         _add_labeled_paragraph(document, "航班号", flight.flight_number or "无法解析")
@@ -434,6 +453,7 @@ def _add_cross_angle_events(document: Document, flights: list[FlightResult]) -> 
             _add_labeled_paragraph(document, "侧风分量", "无法计算")
             _add_labeled_paragraph(document, "风数据来源", "无法计算")
         _add_labeled_paragraph(document, "源文件", flight.path.name)
+        _keep_event_block_together(document, start_index)
 
 
 def _add_pitch_rate_events(document: Document, flights: list[FlightResult]) -> None:
@@ -448,6 +468,7 @@ def _add_pitch_rate_events(document: Document, flights: list[FlightResult]) -> N
         return
 
     for event_index, flight in enumerate(events, start=1):
+        start_index = len(document.paragraphs)
         document.add_heading(f"事件 {event_index}", level=3)
         _add_labeled_paragraph(document, "航段日期时间", _display_time(flight))
         _add_labeled_paragraph(document, "航班号", flight.flight_number or "无法解析")
@@ -459,6 +480,74 @@ def _add_pitch_rate_events(document: Document, flights: list[FlightResult]) -> N
         )
         _add_labeled_paragraph(document, "高高原起飞", _high_altitude_status(flight))
         _add_labeled_paragraph(document, "源文件", flight.path.name)
+        _keep_event_block_together(document, start_index)
+
+
+def _add_reverse_rudder_events(document: Document, flights: list[FlightResult]) -> None:
+    events = [
+        flight
+        for flight in flights
+        if flight.metrics["reverse_rudder"].success
+        and flight.metrics["reverse_rudder"].value is True
+    ]
+    if not events:
+        document.add_paragraph("无")
+        return
+
+    for event_index, flight in enumerate(events, start=1):
+        start_index = len(document.paragraphs)
+        document.add_heading(f"事件 {event_index}", level=3)
+        _add_labeled_paragraph(document, "航段日期时间", _display_time(flight))
+        _add_labeled_paragraph(document, "航班号", flight.flight_number or "无法解析")
+        _add_labeled_paragraph(document, "机型", flight.aircraft_type.value)
+        _add_labeled_paragraph(
+            document,
+            "接地时飞机磁航向",
+            _display_number(
+                None if flight.aircraft_heading is None else flight.aircraft_heading % 360,
+                "°",
+            ),
+        )
+        _add_labeled_paragraph(
+            document,
+            "着陆跑道磁航向",
+            _display_number(
+                None if flight.runway_heading is None else flight.runway_heading % 360,
+                "°",
+            ),
+        )
+        if flight.signed_angle is None:
+            signed_display = "无法计算"
+        elif flight.signed_angle < 0:
+            signed_display = f"左交叉{abs(flight.signed_angle):.2f}°"
+        else:
+            signed_display = f"右交叉{abs(flight.signed_angle):.2f}°"
+        _add_labeled_paragraph(document, "带方向接地交叉角", signed_display)
+        _add_labeled_paragraph(
+            document,
+            "交叉方向",
+            (
+                "左交叉"
+                if flight.signed_angle is not None and flight.signed_angle < 0
+                else "右交叉"
+            ),
+        )
+        if flight.reverse_rudder_value is None:
+            rudder_display = "无法计算"
+        elif flight.reverse_rudder_value > 0:
+            rudder_display = f"左舵+{flight.reverse_rudder_value:.2f}"
+        else:
+            rudder_display = f"右舵{flight.reverse_rudder_value:.2f}"
+        _add_labeled_paragraph(document, "代表舵量值", rudder_display)
+        _add_labeled_paragraph(
+            document,
+            "代表舵量数据所在CSV行",
+            str(flight.reverse_rudder_row or "无法计算"),
+        )
+        _add_labeled_paragraph(document, "50ft行", str(flight.fifty_ft_row or "无法计算"))
+        _add_labeled_paragraph(document, "接地行", str(flight.touchdown_row or "无法计算"))
+        _add_labeled_paragraph(document, "源CSV文件名", flight.path.name)
+        _keep_event_block_together(document, start_index)
 
 
 def _validate_docx(path: Path, expected_people: list[str]) -> None:
@@ -494,7 +583,7 @@ def write_docx_report(output_dir: Path, result: AnalysisResult) -> Path:
         intro = document.add_paragraph()
         intro.paragraph_format.space_after = Pt(10)
         intro.add_run(
-            "本报告汇总所选数据目录内各人员的QAR分析结果，并列出接地交叉角和抬头速率超限事件。"
+            "本报告汇总所选数据目录内各人员的QAR分析结果，并列出接地交叉角、抬头速率超限和疑似接地前反向蹬舵事件。"
         )
         _add_labeled_paragraph(
             document,
@@ -524,6 +613,8 @@ def write_docx_report(output_dir: Path, result: AnalysisResult) -> Path:
             _add_cross_angle_events(document, person_flights)
             document.add_heading("抬头速率事件", level=2)
             _add_pitch_rate_events(document, person_flights)
+            document.add_heading("疑似接地前反向蹬舵事件", level=2)
+            _add_reverse_rudder_events(document, person_flights)
 
         document.save(temporary_path)
         expected_people = [summary.person for summary in result.summaries]

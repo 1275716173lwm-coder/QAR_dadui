@@ -26,6 +26,7 @@ class AircraftConfig:
     marker: str
     altitude_col: int
     stick_cols: tuple[int, int]
+    rudder_cols: tuple[int, int]
     aircraft_heading_col: int
     runway_heading_col: int
     takeoff_group_1: tuple[int, int]
@@ -57,8 +58,13 @@ class FlightResult:
     metrics: dict[str, MetricResult]
     crosswind_metric: MetricResult
     touchdown_row: int | None = None
+    fifty_ft_row: int | None = None
     takeoff_row: int | None = None
+    aircraft_heading: float | None = None
     angle_difference: float | None = None
+    signed_angle: float | None = None
+    reverse_rudder_value: float | None = None
+    reverse_rudder_row: int | None = None
     max_pitch_rate: float | None = None
     baro_altitude: float | None = None
     runway_heading: float | None = None
@@ -83,12 +89,16 @@ class PersonSummary:
     person: str
     stick_exceed_count: int
     stick_exceed_ratio: float | None
+    rudder_exceed_count: int
+    rudder_valid_sample_count: int
+    rudder_exceed_ratio: float | None
     cross_angle_count: int
     cross_angle_ratio: float | None
     pitch_rate_count: int
     pitch_rate_ratio: float | None
     high_altitude_count: int
     high_altitude_ratio: float | None
+    reverse_rudder_count: int
     stats: dict[str, MetricStats]
 
 
@@ -112,6 +122,13 @@ class LogRecord:
     wind_source_row: str = ""
     wind_row_offset: str = ""
     crosswind: str = ""
+    signed_angle: str = ""
+    cross_direction: str = ""
+    reverse_rudder_value: str = ""
+    reverse_rudder_row: str = ""
+    fifty_ft_row: str = ""
+    touchdown_row: str = ""
+    reverse_rudder_triggered: str = ""
 
 
 @dataclass
@@ -147,6 +164,7 @@ CONFIGS: dict[AircraftType, AircraftConfig] = {
         marker="YZDCFM",
         altitude_col=_column_number("D"),
         stick_cols=(_column_number("AM"), _column_number("BB")),
+        rudder_cols=(_column_number("BP"), _column_number("BW")),
         aircraft_heading_col=_column_number("BG"),
         runway_heading_col=_column_number("BH"),
         takeoff_group_1=(_column_number("D"), _column_number("J")),
@@ -162,6 +180,7 @@ CONFIGS: dict[AircraftType, AircraftConfig] = {
         marker="YZDLEAP",
         altitude_col=_column_number("D"),
         stick_cols=(_column_number("AE"), _column_number("AT")),
+        rudder_cols=(_column_number("BF"), _column_number("BM")),
         aircraft_heading_col=_column_number("AW"),
         runway_heading_col=_column_number("AX"),
         takeoff_group_1=(_column_number("D"), _column_number("H")),
@@ -177,6 +196,7 @@ CONFIGS: dict[AircraftType, AircraftConfig] = {
         marker="YZDPW",
         altitude_col=_column_number("D"),
         stick_cols=(_column_number("AE"), _column_number("AT")),
+        rudder_cols=(_column_number("BH"), _column_number("BO")),
         aircraft_heading_col=_column_number("AY"),
         runway_heading_col=_column_number("AZ"),
         takeoff_group_1=(_column_number("D"), _column_number("H")),
@@ -192,9 +212,11 @@ CONFIGS: dict[AircraftType, AircraftConfig] = {
 
 METRIC_LABELS = {
     "stick": "300ft以下杆量",
+    "rudder": "50ft以下舵量",
     "cross_angle": "接地交叉角",
     "pitch_rate": "PF抬头速率",
     "high_altitude": "高高原抬头速率",
+    "reverse_rudder": "疑似接地前反向蹬舵",
 }
 
 _TIME_PATTERN = re.compile(r"(?<!\d)(\d{14})(?!\d)")
@@ -291,7 +313,9 @@ def _select_encoding(path: Path, cancel_event: threading.Event) -> str:
 def _failed_metrics(code: str, message: str) -> dict[str, MetricResult]:
     return {
         "stick": MetricResult(False, error_code=code, error_message=message),
+        "rudder": MetricResult(False, error_code=code, error_message=message),
         "cross_angle": MetricResult(False, error_code=code, error_message=message),
+        "reverse_rudder": MetricResult(False, error_code=code, error_message=message),
         "pitch_rate": MetricResult(False, error_code=code, error_message=message),
         "high_altitude": MetricResult(
             True,
@@ -327,8 +351,17 @@ def analyze_flight(
 
     seen_above_2000 = False
     approach_rows: list[
-        tuple[int, int, float | None, list[float | None], float | None, float | None]
+        tuple[
+            int,
+            int,
+            float | None,
+            list[float | None],
+            list[float | None],
+            float | None,
+            float | None,
+        ]
     ] = []
+    rudder_columns_available = False
     touchdown_data_index: int | None = None
     touchdown_csv_row: int | None = None
     touchdown_aircraft_heading: float | None = None
@@ -361,6 +394,7 @@ def analyze_flight(
             expected_width = len(header)
             if expected_width == 0:
                 raise ValueError("CSV表头为空")
+            rudder_columns_available = expected_width > config.rudder_cols[1]
 
             for data_index, row in enumerate(reader):
                 csv_row = data_index + 3
@@ -402,6 +436,7 @@ def analyze_flight(
                             csv_row,
                             radio_height,
                             _numbers(row, *config.stick_cols),
+                            _numbers(row, *config.rudder_cols),
                             aircraft_heading,
                             runway_value,
                         )
@@ -426,7 +461,7 @@ def analyze_flight(
                                 )
                                 - 180
                             )
-                            landing_needs_wind = touchdown_angle > 6
+                            landing_needs_wind = 6 < touchdown_angle <= 20
 
                 current_pitch_rates = _numbers(row, *config.pitch_rate_cols)
                 if takeoff_data_index is None:
@@ -501,9 +536,20 @@ def analyze_flight(
         landing_error = None
 
     angle_difference: float | None = None
+    signed_angle: float | None = None
+    fifty_ft_csv_row: int | None = None
+    rudder_region_samples: list[tuple[int, float]] = []
+    reverse_rudder_value: float | None = None
+    reverse_rudder_row: int | None = None
     if landing_error:
         metrics["stick"] = MetricResult(False, error_code=landing_error[0], error_message=landing_error[1])
+        metrics["rudder"] = MetricResult(
+            False, error_code=landing_error[0], error_message=landing_error[1]
+        )
         metrics["cross_angle"] = MetricResult(False, error_code=landing_error[0], error_message=landing_error[1])
+        metrics["reverse_rudder"] = MetricResult(
+            False, error_code=landing_error[0], error_message=landing_error[1]
+        )
     else:
         nearest_index = min(
             (index for index, item in enumerate(approach_rows) if item[2] is not None),
@@ -511,7 +557,7 @@ def analyze_flight(
         )
         stick_values = [
             value
-            for _, _, _, row_values, _, _ in approach_rows[nearest_index:]
+            for _, _, _, row_values, _, _, _ in approach_rows[nearest_index:]
             for value in row_values
             if value is not None
         ]
@@ -525,6 +571,66 @@ def analyze_flight(
                 error_message="300ft至接地区域没有有效杆量采样点",
             )
 
+        if not rudder_columns_available:
+            metrics["rudder"] = MetricResult(
+                False,
+                error_code="MISSING_RUDDER_COLUMNS",
+                error_message=(
+                    f"CSV列数不足，{aircraft_type.value}机型舵量需要"
+                    f"{config.rudder_cols[0] + 1}至{config.rudder_cols[1] + 1}列"
+                ),
+            )
+        else:
+            valid_heights = [
+                (index, float(item[2]))
+                for index, item in enumerate(approach_rows)
+                if item[2] is not None
+            ]
+            crossings = [
+                (upper, lower)
+                for upper, lower in zip(valid_heights, valid_heights[1:])
+                if upper[1] >= 50 and lower[1] <= 50
+            ]
+            if not crossings:
+                metrics["rudder"] = MetricResult(
+                    False,
+                    error_code="NO_50FT_CROSSING",
+                    error_message="接地前未找到最终下降阶段由不低于50ft至不高于50ft的穿越",
+                )
+            else:
+                upper, lower = crossings[-1]
+                fifty_index = (
+                    upper[0]
+                    if abs(upper[1] - 50) <= abs(lower[1] - 50)
+                    else lower[0]
+                )
+                fifty_ft_csv_row = approach_rows[fifty_index][1]
+                rudder_region_samples = [
+                    (csv_row, value)
+                    for _, csv_row, _, _, row_values, _, _ in approach_rows[fifty_index:]
+                    for value in row_values
+                    if value is not None
+                ]
+                if not rudder_region_samples:
+                    metrics["rudder"] = MetricResult(
+                        False,
+                        error_code="NO_RUDDER_VALUES",
+                        error_message="50ft行至接地行区域没有有效舵量采样点",
+                    )
+                else:
+                    rudder_exceed = sum(
+                        abs(value) > 15 for _, value in rudder_region_samples
+                    )
+                    metrics["rudder"] = MetricResult(
+                        True,
+                        {
+                            "reff": rudder_exceed,
+                            "rall": len(rudder_region_samples),
+                            "fifty_ft_row": fifty_ft_csv_row,
+                            "touchdown_row": touchdown_csv_row,
+                        },
+                    )
+
         if touchdown_aircraft_heading is None:
             metrics["cross_angle"] = MetricResult(
                 False, error_code="NO_AIRCRAFT_HEADING", error_message="接地行飞机磁航向无有效值"
@@ -534,10 +640,80 @@ def analyze_flight(
                 False, error_code="NO_RUNWAY_HEADING", error_message="接地行及其上方没有有效跑道磁航向"
             )
         else:
-            angle_difference = abs(
-                ((touchdown_aircraft_heading - touchdown_runway_heading + 180) % 360) - 180
+            signed_angle = (
+                (touchdown_aircraft_heading - touchdown_runway_heading + 180) % 360
+            ) - 180
+            angle_difference = abs(signed_angle)
+            if angle_difference > 20:
+                metrics["cross_angle"] = MetricResult(
+                    False,
+                    error_code="CROSS_ANGLE_OUT_OF_RANGE",
+                    error_message=(
+                        f"接地交叉角{angle_difference:.2f}°严格大于20°，判定为错误数据"
+                    ),
+                )
+            else:
+                metrics["cross_angle"] = MetricResult(True, angle_difference > 6)
+
+        if angle_difference is not None and angle_difference > 20:
+            metrics["reverse_rudder"] = MetricResult(
+                False,
+                error_code="CROSS_ANGLE_OUT_OF_RANGE",
+                error_message=(
+                    f"接地交叉角{angle_difference:.2f}°严格大于20°，"
+                    "判定为错误数据，不进行反向蹬舵判断"
+                ),
             )
-            metrics["cross_angle"] = MetricResult(True, angle_difference > 6)
+        elif not rudder_columns_available:
+            metrics["reverse_rudder"] = MetricResult(
+                False,
+                error_code="MISSING_RUDDER_COLUMNS",
+                error_message=(
+                    f"CSV列数不足，{aircraft_type.value}机型舵量需要"
+                    f"{config.rudder_cols[0] + 1}至{config.rudder_cols[1] + 1}列"
+                ),
+            )
+        elif fifty_ft_csv_row is None:
+            metrics["reverse_rudder"] = MetricResult(
+                False,
+                error_code="NO_50FT_CROSSING",
+                error_message="接地前未找到最终下降阶段由不低于50ft至不高于50ft的穿越",
+            )
+        elif not rudder_region_samples:
+            metrics["reverse_rudder"] = MetricResult(
+                False,
+                error_code="NO_RUDDER_VALUES",
+                error_message="50ft行至接地行区域没有有效舵量采样点",
+            )
+        elif touchdown_aircraft_heading is None:
+            metrics["reverse_rudder"] = MetricResult(
+                False,
+                error_code="NO_AIRCRAFT_HEADING",
+                error_message="接地行飞机磁航向无有效值",
+            )
+        elif touchdown_runway_heading is None:
+            metrics["reverse_rudder"] = MetricResult(
+                False,
+                error_code="NO_RUNWAY_HEADING",
+                error_message="接地行及其上方没有有效跑道磁航向",
+            )
+        else:
+            assert signed_angle is not None
+            matching_samples: list[tuple[int, float]] = []
+            if abs(signed_angle) > 3:
+                matching_samples = [
+                    (csv_row, value)
+                    for csv_row, value in rudder_region_samples
+                    if signed_angle * value < 0
+                ]
+            if matching_samples:
+                reverse_rudder_row, reverse_rudder_value = matching_samples[0]
+                for csv_row, value in matching_samples[1:]:
+                    if abs(value) > abs(reverse_rudder_value):
+                        reverse_rudder_row, reverse_rudder_value = csv_row, value
+            metrics["reverse_rudder"] = MetricResult(
+                True, reverse_rudder_value is not None
+            )
 
     max_pitch_rate: float | None = None
     if takeoff_data_index is None:
@@ -632,8 +808,13 @@ def analyze_flight(
         metrics=metrics,
         crosswind_metric=crosswind_metric,
         touchdown_row=touchdown_csv_row,
+        fifty_ft_row=fifty_ft_csv_row,
         takeoff_row=takeoff_csv_row,
+        aircraft_heading=touchdown_aircraft_heading,
         angle_difference=angle_difference,
+        signed_angle=signed_angle,
+        reverse_rudder_value=reverse_rudder_value,
+        reverse_rudder_row=reverse_rudder_row,
         max_pitch_rate=max_pitch_rate,
         baro_altitude=takeoff_baro,
         runway_heading=touchdown_runway_heading,
@@ -651,16 +832,19 @@ def _summarize_person(person: str, flights: Iterable[FlightResult]) -> PersonSum
     stats = {key: MetricStats() for key in METRIC_LABELS}
     stick_exceed = 0
     stick_total = 0
+    rudder_exceed = 0
+    rudder_total = 0
 
     for flight in flight_list:
-        for key in ("stick", "cross_angle", "pitch_rate"):
+        for key in ("stick", "rudder", "cross_angle", "pitch_rate", "reverse_rudder"):
             metric = flight.metrics[key]
             item = stats[key]
             item.candidate += 1
             if metric.success:
                 item.valid += 1
-                if key == "stick":
-                    if metric.value["beff"] > 0:
+                if key in ("stick", "rudder"):
+                    exceed_key = "beff" if key == "stick" else "reff"
+                    if metric.value[exceed_key] > 0:
                         item.triggered += 1
                 elif metric.value is True:
                     item.triggered += 1
@@ -682,6 +866,11 @@ def _summarize_person(person: str, flights: Iterable[FlightResult]) -> PersonSum
             stick_exceed += int(stick_metric.value["beff"])
             stick_total += int(stick_metric.value["ball"])
 
+        rudder_metric = flight.metrics["rudder"]
+        if rudder_metric.success:
+            rudder_exceed += int(rudder_metric.value["reff"])
+            rudder_total += int(rudder_metric.value["rall"])
+
     cross = stats["cross_angle"]
     pitch = stats["pitch_rate"]
     high = stats["high_altitude"]
@@ -689,12 +878,16 @@ def _summarize_person(person: str, flights: Iterable[FlightResult]) -> PersonSum
         person=person,
         stick_exceed_count=stick_exceed,
         stick_exceed_ratio=(stick_exceed / stick_total) if stick_total else None,
+        rudder_exceed_count=rudder_exceed,
+        rudder_valid_sample_count=rudder_total,
+        rudder_exceed_ratio=(rudder_exceed / rudder_total) if rudder_total else None,
         cross_angle_count=cross.triggered,
         cross_angle_ratio=(cross.triggered / cross.valid) if cross.valid else None,
         pitch_rate_count=pitch.triggered,
         pitch_rate_ratio=(pitch.triggered / pitch.valid) if pitch.valid else None,
         high_altitude_count=high.triggered,
         high_altitude_ratio=(high.triggered / high.valid) if high.valid else None,
+        reverse_rudder_count=stats["reverse_rudder"].triggered,
         stats=stats,
     )
 
@@ -709,13 +902,38 @@ def _metric_log_record(flight: FlightResult, key: str, metric: MetricResult) -> 
         value = str(metric.value)
     if metric.success and key == "cross_angle" and flight.angle_difference is not None:
         value = f"触发={bool(metric.value)}；实际交叉角={flight.angle_difference:.2f}°"
+    elif metric.success and key == "rudder":
+        value = (
+            f"Reff={metric.value['reff']}；Rall={metric.value['rall']}；"
+            f"50ft行={metric.value['fifty_ft_row']}；"
+            f"接地行={metric.value['touchdown_row']}"
+        )
     elif metric.success and key == "pitch_rate" and flight.max_pitch_rate is not None:
         value = f"触发={bool(metric.value)}；最大抬头速率={flight.max_pitch_rate:.2f}°/s"
     elif metric.success and key == "high_altitude" and flight.baro_altitude is not None:
         value = f"高高原={bool(metric.value)}；气压高度={flight.baro_altitude:.2f} ft"
+    elif metric.success and key == "reverse_rudder":
+        direction = (
+            "左交叉" if flight.signed_angle is not None and flight.signed_angle < 0 else "右交叉"
+        )
+        representative = (
+            "" if flight.reverse_rudder_value is None else f"{flight.reverse_rudder_value:.2f}"
+        )
+        value = (
+            f"触发={bool(metric.value)}；带方向交叉角={flight.signed_angle:.2f}°；"
+            f"交叉方向={direction}；代表舵量={representative}；"
+            f"代表舵量CSV行={flight.reverse_rudder_row or ''}；"
+            f"50ft行={flight.fifty_ft_row or ''}；接地行={flight.touchdown_row or ''}"
+        )
     message = metric.error_message
     if value:
         message = f"值={value}" + (f"；{message}" if message else "")
+    direction = ""
+    if key == "reverse_rudder" and flight.signed_angle is not None:
+        if flight.signed_angle < 0:
+            direction = "左交叉"
+        elif flight.signed_angle > 0:
+            direction = "右交叉"
     return LogRecord(
         record_type="DETAIL",
         timestamp=datetime.now(),
@@ -726,6 +944,25 @@ def _metric_log_record(flight: FlightResult, key: str, metric: MetricResult) -> 
         status=status,
         error_code=metric.error_code,
         message=message,
+        signed_angle=(
+            f"{flight.signed_angle:.2f}"
+            if key == "reverse_rudder" and flight.signed_angle is not None
+            else ""
+        ),
+        cross_direction=direction,
+        reverse_rudder_value=(
+            f"{flight.reverse_rudder_value:.2f}"
+            if key == "reverse_rudder" and flight.reverse_rudder_value is not None
+            else ""
+        ),
+        reverse_rudder_row=(
+            str(flight.reverse_rudder_row or "") if key == "reverse_rudder" else ""
+        ),
+        fifty_ft_row=(str(flight.fifty_ft_row or "") if key == "reverse_rudder" else ""),
+        touchdown_row=(str(flight.touchdown_row or "") if key == "reverse_rudder" else ""),
+        reverse_rudder_triggered=(
+            str(bool(metric.value)) if key == "reverse_rudder" and metric.success else ""
+        ),
     )
 
 
@@ -867,11 +1104,20 @@ def analyze_selected_folder(
 
     for summary in summaries:
         for key, item in summary.stats.items():
+            summary_message = ""
+            if key == "rudder":
+                summary_message = (
+                    f"Reff合计={summary.rudder_exceed_count}；"
+                    f"Rall合计={summary.rudder_valid_sample_count}"
+                )
+                if summary.rudder_valid_sample_count == 0:
+                    summary_message += "；该人员没有可用于舵量指标的有效采样点"
             log_records.append(
                 LogRecord(
                     record_type="SUMMARY", timestamp=datetime.now(), person=summary.person,
                     metric=METRIC_LABELS[key], status="SUMMARY", candidate=str(item.candidate),
                     valid=str(item.valid), triggered=str(item.triggered), failed=str(item.failed),
+                    message=summary_message,
                 )
             )
 
