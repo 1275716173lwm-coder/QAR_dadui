@@ -28,7 +28,7 @@ class QarApp:
         else:
             resource_dir = Path(__file__).resolve().parent
             self.base_dir = resource_dir
-        self.template_path = resource_dir / "result_sample" / "result_sample.xlsx"
+        self.template_path = Path(r"G:\OneDrive - cqu.edu.cn\飞行资料\CA\飞行部\QAR\result_sample\result_sample.xlsx")
         self.output_dir = self.base_dir / "result"
         self.messages: queue.Queue[WorkerMessage] = queue.Queue()
         self.cancel_event = threading.Event()
@@ -41,6 +41,7 @@ class QarApp:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.folder_var = tk.StringVar()
+        self.database_var = tk.StringVar()
         self.person_var = tk.StringVar(value="尚未开始")
         self.file_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="请选择包含人员子文件夹的数据目录")
@@ -58,15 +59,21 @@ class QarApp:
         self.browse_button = ttk.Button(container, text="选择文件夹", command=self._choose_folder)
         self.browse_button.grid(row=1, column=1, sticky="ew")
 
+        ttk.Label(container, text="飞机数据库（.xlsx）").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.database_entry = ttk.Entry(container, textvariable=self.database_var)
+        self.database_entry.grid(row=3, column=0, sticky="ew", padx=(0, 8))
+        self.database_button = ttk.Button(container, text="选择数据库", command=self._choose_database)
+        self.database_button.grid(row=3, column=1, sticky="ew")
+
         buttons = ttk.Frame(container)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 14))
+        buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 14))
         self.start_button = ttk.Button(buttons, text="开始分析", command=self._start)
         self.start_button.pack(side="left")
         self.cancel_button = ttk.Button(buttons, text="取消", command=self._cancel, state="disabled")
         self.cancel_button.pack(side="left", padx=(8, 0))
 
         info = ttk.LabelFrame(container, text="分析进度", padding=10)
-        info.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        info.grid(row=5, column=0, columnspan=2, sticky="nsew")
         info.columnconfigure(1, weight=1)
         info.rowconfigure(4, weight=1)
 
@@ -85,12 +92,17 @@ class QarApp:
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(3, weight=1)
+        container.rowconfigure(5, weight=1)
 
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(title="选择包含人员子文件夹的数据目录")
         if selected:
             self.folder_var.set(selected)
+
+    def _choose_database(self) -> None:
+        selected = filedialog.askopenfilename(title="选择飞机数据库", filetypes=[("Excel工作簿", "*.xlsx")])
+        if selected:
+            self.database_var.set(selected)
 
     def _append_status(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -104,6 +116,8 @@ class QarApp:
         self.start_button.configure(state=normal)
         self.browse_button.configure(state=normal)
         self.folder_entry.configure(state=normal)
+        self.database_button.configure(state=normal)
+        self.database_entry.configure(state=normal)
         self.cancel_button.configure(state="normal" if running else "disabled")
 
     def _start(self) -> None:
@@ -114,6 +128,14 @@ class QarApp:
         selected_folder = Path(folder_text)
         if not selected_folder.exists() or not selected_folder.is_dir():
             messagebox.showerror("目录无效", "所选路径不存在或不是文件夹。")
+            return
+        database_text = self.database_var.get().strip()
+        if not database_text:
+            messagebox.showwarning("未选择数据库", "请先选择飞机数据库.xlsx文件。")
+            return
+        database_path = Path(database_text)
+        if database_path.suffix.lower() != ".xlsx" or not database_path.is_file():
+            messagebox.showerror("数据库无效", "飞机数据库必须是有效的.xlsx文件。")
             return
         if not self.template_path.exists():
             messagebox.showerror("模板缺失", f"找不到结果模板：\n{self.template_path}")
@@ -129,7 +151,7 @@ class QarApp:
         self._set_running(True)
         self.worker = threading.Thread(
             target=self._run_worker,
-            args=(selected_folder,),
+            args=(selected_folder, database_path),
             daemon=False,
             name="qar-analysis-worker",
         )
@@ -138,14 +160,14 @@ class QarApp:
     def _progress_callback(self, event: ProgressEvent) -> None:
         self.messages.put(WorkerMessage("progress", event))
 
-    def _run_worker(self, selected_folder: Path) -> None:
+    def _run_worker(self, selected_folder: Path, database_path: Path) -> None:
         result: AnalysisResult | None = None
         try:
-            result = analyze_selected_folder(selected_folder, self.cancel_event, self._progress_callback)
+            result = analyze_selected_folder(selected_folder, database_path, self.cancel_event, self._progress_callback)
             workbook_path: Path | None = None
             report_path: Path | None = None
             output_errors: list[str] = []
-            if not result.cancelled:
+            if not result.cancelled and not result.preflight_failed:
                 try:
                     workbook_path = write_workbook(self.template_path, self.output_dir, result.summaries)
                 except OutputError as exc:
@@ -205,6 +227,8 @@ class QarApp:
             log_path = write_log(self.output_dir, result)
             if result.cancelled:
                 self.messages.put(WorkerMessage("cancelled", (result, log_path)))
+            elif result.preflight_failed:
+                self.messages.put(WorkerMessage("preflight_failed", (result, log_path)))
             else:
                 self.messages.put(
                     WorkerMessage(
@@ -218,6 +242,7 @@ class QarApp:
             if result is None:
                 result = AnalysisResult(
                     selected_folder=selected_folder,
+                    aircraft_database=database_path,
                     started_at=now,
                     ended_at=now,
                     summaries=[],
@@ -252,7 +277,7 @@ class QarApp:
         self.progress.configure(maximum=maximum, value=min(event.completed, maximum))
         if event.message:
             self.status_var.set(event.message)
-            if event.stage in {"started", "person", "progress", "analyzed", "cancelled"}:
+            if event.stage in {"database", "preflight", "preflight_failed", "started", "person", "progress", "analyzed", "cancelled"}:
                 self._append_status(event.message)
 
     def _finish_ui(self) -> None:
@@ -301,6 +326,14 @@ class QarApp:
                     self._finish_ui()
                     if not self.close_requested:
                         messagebox.showinfo("已取消", text)
+                elif message.kind == "preflight_failed":
+                    _, log_path = message.payload  # type: ignore[misc]
+                    text = f"飞机数据库或注册号预检失败，未执行指标分析，未生成Excel和DOCX。\n日志：{log_path}"
+                    self.status_var.set("预检失败")
+                    self._append_status(text.replace("\n", "；"))
+                    self._finish_ui()
+                    if not self.close_requested:
+                        messagebox.showerror("预检失败", text)
                 elif message.kind == "fatal":
                     text = str(message.payload)
                     self.status_var.set("分析失败")

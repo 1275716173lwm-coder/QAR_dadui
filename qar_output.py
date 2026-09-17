@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import gc
+import time
 import uuid
 import zipfile
 from copy import copy
@@ -13,6 +15,7 @@ from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.shared import Inches, Pt, RGBColor
 from openpyxl import load_workbook
 
@@ -28,11 +31,13 @@ LOG_HEADERS = [
     "说明", "候选文件数", "有效文件数", "触发文件数", "失败文件数",
     "Excel结果文件", "DOCX状态", "风数据来源行", "风数据行差", "侧风分量kt",
     "带方向接地交叉角", "交叉方向", "反向蹬舵代表值", "代表值CSV行",
-    "50ft行", "接地行", "反向蹬舵触发",
+    "50ft行", "接地行", "反向蹬舵触发", "飞机数据库", "原始注册号",
+    "标准化注册号", "数据库具体机型", "输出机型分类", "文件名发动机标记", "跳过文件数",
 ]
 
 WORKBOOK_HEADERS = [
     "姓名",
+    "机型分类",
     "低空 300ft AGL 以下杆量超过 15 个单位采样点数",
     "低空 300ft AGL 以下杆量超过 15 个单位采样点占比",
     "低空 50ft AGL 以下舵量超过 15 个单位次数",
@@ -81,6 +86,18 @@ def _publish_without_overwrite(temporary_path: Path, target_path: Path, label: s
             raise OutputError(f"无法发布{label}：{exc}") from exc
 
 
+def _remove_temporary_file(path: Path) -> None:
+    """Best-effort cleanup, including Windows handles released during exception GC."""
+    for attempt in range(3):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError:
+            gc.collect()
+            if attempt < 2:
+                time.sleep(0.05)
+
+
 def create_log_path(output_dir: Path, started_at: datetime) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"qar_log_{started_at:%Y%m%d_%H%M%S}"
@@ -119,6 +136,13 @@ def write_log(output_dir: Path, result: AnalysisResult, extra_records: list[LogR
                 record.fifty_ft_row,
                 record.touchdown_row,
                 record.reverse_rudder_triggered,
+                record.aircraft_database,
+                record.registration_raw,
+                record.registration,
+                record.database_aircraft_type,
+                record.aircraft_category,
+                record.filename_engine_marker,
+                record.skipped,
             ]
             handle.write("\t".join(_safe_text(value) for value in row) + "\n")
     return path
@@ -127,6 +151,7 @@ def write_log(output_dir: Path, result: AnalysisResult, extra_records: list[LogR
 def _write_summary_row(sheet, row: int, summary: PersonSummary) -> None:
     values = [
         summary.person,
+        summary.aircraft_category,
         summary.stick_exceed_count,
         summary.stick_exceed_ratio,
         summary.rudder_exceed_count,
@@ -141,7 +166,7 @@ def _write_summary_row(sheet, row: int, summary: PersonSummary) -> None:
     ]
     for column, value in enumerate(values, start=1):
         sheet.cell(row=row, column=column, value=value)
-    for column in (3, 5, 7, 9, 11):
+    for column in (4, 6, 8, 10, 12):
         sheet.cell(row=row, column=column).number_format = "0.00%"
 
 
@@ -159,6 +184,9 @@ def write_workbook(template_path: Path, output_dir: Path, summaries: list[Person
         sheet = workbook.worksheets[0]
         if sheet.max_column < 12:
             raise OutputError(f"结果模板至少需要12列，当前只有{sheet.max_column}列")
+        for merged_range in list(sheet.merged_cells.ranges):
+            if merged_range.min_row >= 2:
+                sheet.unmerge_cells(str(merged_range))
         if sheet.max_row > 1:
             sheet.delete_rows(2, sheet.max_row - 1)
         for column, header in enumerate(WORKBOOK_HEADERS, start=1):
@@ -171,6 +199,26 @@ def write_workbook(template_path: Path, output_dir: Path, summaries: list[Person
         sheet.row_dimensions[1].height = max(sheet.row_dimensions[1].height or 0, 96)
         for row, summary in enumerate(summaries, start=2):
             _write_summary_row(sheet, row, summary)
+        last_row = max(1, len(summaries) + 1)
+        for row in sheet.iter_rows(min_row=1, max_row=last_row, min_col=1, max_col=len(WORKBOOK_HEADERS)):
+            for cell in row:
+                alignment = copy(cell.alignment)
+                alignment.horizontal = "center"
+                alignment.vertical = "center"
+                cell.alignment = alignment
+        person_start = 2
+        while person_start < 2 + len(summaries):
+            person = sheet.cell(person_start, 1).value
+            person_end = person_start
+            while person_end + 1 < 2 + len(summaries) and sheet.cell(person_end + 1, 1).value == person:
+                person_end += 1
+            if person_end > person_start:
+                sheet.merge_cells(start_row=person_start, start_column=1, end_row=person_end, end_column=1)
+                alignment = copy(sheet.cell(person_start, 1).alignment)
+                alignment.horizontal = "center"
+                alignment.vertical = "center"
+                sheet.cell(person_start, 1).alignment = alignment
+            person_start = person_end + 1
         workbook.save(temporary_path)
         workbook.close()
         workbook = None
@@ -180,8 +228,8 @@ def write_workbook(template_path: Path, output_dir: Path, summaries: list[Person
             if not validation_workbook.worksheets:
                 raise OutputError("临时结果工作簿校验失败：没有工作表")
             validation_sheet = validation_workbook.worksheets[0]
-            if validation_sheet.max_column < 12:
-                raise OutputError("临时结果工作簿校验失败：列数不足12列")
+            if validation_sheet.max_column < 13:
+                raise OutputError("临时结果工作簿校验失败：列数不足13列")
         finally:
             validation_workbook.close()
 
@@ -198,10 +246,7 @@ def write_workbook(template_path: Path, output_dir: Path, summaries: list[Person
                 workbook.close()
             except Exception:
                 pass
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_temporary_file(temporary_path)
 
 
 def _set_font(run, name: str, size: float | None = None, bold: bool | None = None) -> None:
@@ -236,6 +281,7 @@ def _configure_document(document: Document) -> None:
         "Heading 1": (15, True, 8),
         "Heading 2": (12, True, 6),
         "Heading 3": (11, True, 4),
+        "Heading 4": (10, True, 2),
     }
     for style_name, (size, bold, after) in style_settings.items():
         style = document.styles[style_name]
@@ -336,23 +382,24 @@ def _add_two_column_table(document: Document, rows: list[tuple[str, str]]) -> No
 
 
 def _format_ratio(value: float | None) -> str:
-    return "无有效数据" if value is None else f"{value:.2%}"
+    return f"{(0.0 if value is None else value):.2%}"
 
 
 def _summary_rows(summary: PersonSummary) -> list[tuple[str, str]]:
     return [
         (WORKBOOK_HEADERS[0], summary.person),
-        (WORKBOOK_HEADERS[1], str(summary.stick_exceed_count)),
-        (WORKBOOK_HEADERS[2], _format_ratio(summary.stick_exceed_ratio)),
-        (WORKBOOK_HEADERS[3], str(summary.rudder_exceed_count)),
-        (WORKBOOK_HEADERS[4], _format_ratio(summary.rudder_exceed_ratio)),
-        (WORKBOOK_HEADERS[5], str(summary.cross_angle_count)),
-        (WORKBOOK_HEADERS[6], _format_ratio(summary.cross_angle_ratio)),
-        (WORKBOOK_HEADERS[7], str(summary.pitch_rate_count)),
-        (WORKBOOK_HEADERS[8], _format_ratio(summary.pitch_rate_ratio)),
-        (WORKBOOK_HEADERS[9], str(summary.high_altitude_count)),
-        (WORKBOOK_HEADERS[10], _format_ratio(summary.high_altitude_ratio)),
-        (WORKBOOK_HEADERS[11], str(summary.reverse_rudder_count)),
+        (WORKBOOK_HEADERS[1], summary.aircraft_category),
+        (WORKBOOK_HEADERS[2], str(summary.stick_exceed_count)),
+        (WORKBOOK_HEADERS[3], _format_ratio(summary.stick_exceed_ratio)),
+        (WORKBOOK_HEADERS[4], str(summary.rudder_exceed_count)),
+        (WORKBOOK_HEADERS[5], _format_ratio(summary.rudder_exceed_ratio)),
+        (WORKBOOK_HEADERS[6], str(summary.cross_angle_count)),
+        (WORKBOOK_HEADERS[7], _format_ratio(summary.cross_angle_ratio)),
+        (WORKBOOK_HEADERS[8], str(summary.pitch_rate_count)),
+        (WORKBOOK_HEADERS[9], _format_ratio(summary.pitch_rate_ratio)),
+        (WORKBOOK_HEADERS[10], str(summary.high_altitude_count)),
+        (WORKBOOK_HEADERS[11], _format_ratio(summary.high_altitude_ratio)),
+        (WORKBOOK_HEADERS[12], str(summary.reverse_rudder_count)),
     ]
 
 
@@ -363,6 +410,46 @@ def _add_labeled_paragraph(document: Document, label: str, value: str) -> None:
     _set_font(label_run, "Microsoft YaHei", 10.5, bold=True)
     value_run = paragraph.add_run(value)
     _set_font(value_run, "Microsoft YaHei", 10.5)
+
+
+def _add_file_hyperlink_paragraph(document: Document, label: str, path: Path) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(2)
+    label_run = paragraph.add_run(f"{label}：")
+    _set_font(label_run, "Microsoft YaHei", 10.5, bold=True)
+
+    # Word on Windows can pass percent-encoded file:// URIs through literally
+    # (for example, "%20" remains part of the filename) and can misdecode
+    # non-ASCII path segments.  Store the native absolute Windows path in the
+    # external relationship so Word hands the original Unicode path to Windows.
+    target = str(path.resolve())
+    relationship_id = paragraph.part.relate_to(target, RT.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), relationship_id)
+    hyperlink.set(qn("w:history"), "1")
+
+    run = OxmlElement("w:r")
+    properties = OxmlElement("w:rPr")
+    fonts = OxmlElement("w:rFonts")
+    fonts.set(qn("w:ascii"), "Microsoft YaHei")
+    fonts.set(qn("w:hAnsi"), "Microsoft YaHei")
+    fonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    properties.append(fonts)
+    size = OxmlElement("w:sz")
+    size.set(qn("w:val"), "21")
+    properties.append(size)
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0563C1")
+    properties.append(color)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    properties.append(underline)
+    run.append(properties)
+    text = OxmlElement("w:t")
+    text.text = path.name
+    run.append(text)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
 
 
 def _keep_event_block_together(document: Document, start_index: int) -> None:
@@ -403,7 +490,7 @@ def _add_cross_angle_events(document: Document, flights: list[FlightResult]) -> 
 
     for event_index, flight in enumerate(events, start=1):
         start_index = len(document.paragraphs)
-        document.add_heading(f"事件 {event_index}", level=3)
+        document.add_heading(f"事件 {event_index}", level=4)
         _add_labeled_paragraph(document, "航段日期时间", _display_time(flight))
         _add_labeled_paragraph(document, "航班号", flight.flight_number or "无法解析")
         _add_labeled_paragraph(document, "机型", flight.aircraft_type.value)
@@ -452,7 +539,7 @@ def _add_cross_angle_events(document: Document, flights: list[FlightResult]) -> 
             _add_labeled_paragraph(document, "采用的风向", "无法计算")
             _add_labeled_paragraph(document, "侧风分量", "无法计算")
             _add_labeled_paragraph(document, "风数据来源", "无法计算")
-        _add_labeled_paragraph(document, "源文件", flight.path.name)
+        _add_file_hyperlink_paragraph(document, "源文件", flight.path)
         _keep_event_block_together(document, start_index)
 
 
@@ -469,7 +556,7 @@ def _add_pitch_rate_events(document: Document, flights: list[FlightResult]) -> N
 
     for event_index, flight in enumerate(events, start=1):
         start_index = len(document.paragraphs)
-        document.add_heading(f"事件 {event_index}", level=3)
+        document.add_heading(f"事件 {event_index}", level=4)
         _add_labeled_paragraph(document, "航段日期时间", _display_time(flight))
         _add_labeled_paragraph(document, "航班号", flight.flight_number or "无法解析")
         _add_labeled_paragraph(document, "机型", flight.aircraft_type.value)
@@ -479,7 +566,7 @@ def _add_pitch_rate_events(document: Document, flights: list[FlightResult]) -> N
             _display_number(flight.max_pitch_rate, "°/s"),
         )
         _add_labeled_paragraph(document, "高高原起飞", _high_altitude_status(flight))
-        _add_labeled_paragraph(document, "源文件", flight.path.name)
+        _add_file_hyperlink_paragraph(document, "源文件", flight.path)
         _keep_event_block_together(document, start_index)
 
 
@@ -496,7 +583,7 @@ def _add_reverse_rudder_events(document: Document, flights: list[FlightResult]) 
 
     for event_index, flight in enumerate(events, start=1):
         start_index = len(document.paragraphs)
-        document.add_heading(f"事件 {event_index}", level=3)
+        document.add_heading(f"事件 {event_index}", level=4)
         _add_labeled_paragraph(document, "航段日期时间", _display_time(flight))
         _add_labeled_paragraph(document, "航班号", flight.flight_number or "无法解析")
         _add_labeled_paragraph(document, "机型", flight.aircraft_type.value)
@@ -546,7 +633,7 @@ def _add_reverse_rudder_events(document: Document, flights: list[FlightResult]) 
         )
         _add_labeled_paragraph(document, "50ft行", str(flight.fifty_ft_row or "无法计算"))
         _add_labeled_paragraph(document, "接地行", str(flight.touchdown_row or "无法计算"))
-        _add_labeled_paragraph(document, "源CSV文件名", flight.path.name)
+        _add_file_hyperlink_paragraph(document, "源CSV文件名", flight.path)
         _keep_event_block_together(document, start_index)
 
 
@@ -567,8 +654,8 @@ def _validate_docx(path: Path, expected_people: list[str]) -> None:
 
 
 def write_docx_report(output_dir: Path, result: AnalysisResult) -> Path:
-    if result.cancelled:
-        raise OutputError("分析已取消，不生成DOCX报告")
+    if result.cancelled or result.preflight_failed:
+        raise OutputError("分析已取消或预检失败，不生成DOCX报告")
     output_dir.mkdir(parents=True, exist_ok=True)
     temporary_path = output_dir / f".qar_report_{uuid.uuid4().hex}.tmp.docx"
 
@@ -596,28 +683,33 @@ def write_docx_report(output_dir: Path, result: AnalysisResult) -> Path:
             result.ended_at.strftime("%Y-%m-%d %H:%M:%S"),
         )
         _add_labeled_paragraph(document, "所选数据目录", str(result.selected_folder))
-        _add_labeled_paragraph(document, "人员数量", str(len(result.summaries)))
+        _add_labeled_paragraph(document, "人员数量", str(len({summary.person for summary in result.summaries})))
 
-        flights_by_person: dict[str, list[FlightResult]] = {}
+        flights_by_group: dict[tuple[str, str], list[FlightResult]] = {}
         for flight in result.flights:
-            flights_by_person.setdefault(flight.person, []).append(flight)
+            flights_by_group.setdefault((flight.person, flight.aircraft_category), []).append(flight)
 
-        for person_index, summary in enumerate(result.summaries):
+        summaries_by_person: dict[str, list[PersonSummary]] = {}
+        for summary in result.summaries:
+            summaries_by_person.setdefault(summary.person, []).append(summary)
+        for person_index, (person, person_summaries) in enumerate(summaries_by_person.items()):
             if person_index:
                 document.add_paragraph()
-            document.add_heading(summary.person, level=1)
-            document.add_heading("人员指标汇总", level=2)
-            _add_two_column_table(document, _summary_rows(summary))
-            person_flights = flights_by_person.get(summary.person, [])
-            document.add_heading("接地交叉角事件", level=2)
-            _add_cross_angle_events(document, person_flights)
-            document.add_heading("抬头速率事件", level=2)
-            _add_pitch_rate_events(document, person_flights)
-            document.add_heading("疑似接地前反向蹬舵事件", level=2)
-            _add_reverse_rudder_events(document, person_flights)
+            document.add_heading(person, level=1)
+            for summary in person_summaries:
+                document.add_heading(summary.aircraft_category, level=2)
+                document.add_heading("指标汇总", level=3)
+                _add_two_column_table(document, _summary_rows(summary))
+                group_flights = flights_by_group.get((person, summary.aircraft_category), [])
+                document.add_heading("接地交叉角事件", level=3)
+                _add_cross_angle_events(document, group_flights)
+                document.add_heading("抬头速率事件", level=3)
+                _add_pitch_rate_events(document, group_flights)
+                document.add_heading("疑似接地前反向蹬舵事件", level=3)
+                _add_reverse_rudder_events(document, group_flights)
 
         document.save(temporary_path)
-        expected_people = [summary.person for summary in result.summaries]
+        expected_people = list(summaries_by_person)
         _validate_docx(temporary_path, expected_people)
         stem = f"qar_report_{result.started_at:%Y%m%d_%H%M%S}"
         target_path = output_dir / f"{stem}.docx"
@@ -627,7 +719,4 @@ def write_docx_report(output_dir: Path, result: AnalysisResult) -> Path:
     except Exception as exc:
         raise OutputError(f"生成DOCX报告失败：{exc}") from exc
     finally:
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_temporary_file(temporary_path)

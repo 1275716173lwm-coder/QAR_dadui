@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from openpyxl import Workbook, load_workbook
 
 from qar_analyzer import (
@@ -45,6 +46,8 @@ def synthetic_cfm(
     aircraft_type: AircraftType = AircraftType.CFM,
     altitudes: tuple[object, ...] = (2100, 300, 50, -1, -1),
     rudder_rows: dict[int, list[object]] | None = None,
+    metadata_preamble: bool = False,
+    constant_runway_heading: bool = False,
 ) -> None:
     config = CONFIGS[aircraft_type]
     width = max(
@@ -91,6 +94,8 @@ def synthetic_cfm(
     )
     set_value(rows[touchdown_index], config.aircraft_heading_col, aircraft_heading)
     set_value(rows[touchdown_index], config.runway_heading_col, runway_heading)
+    if not constant_runway_heading and touchdown_index + 1 < len(rows):
+        set_value(rows[touchdown_index + 1], config.runway_heading_col, runway_heading + 1)
 
     if rudder_rows is None:
         rudder_rows = {
@@ -109,9 +114,25 @@ def synthetic_cfm(
 
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
+        if metadata_preamble:
+            writer.writerow(
+                ["dataframe info   name:test", "word:1024", "version:1", "code:test"]
+            )
         writer.writerow(header)
         writer.writerow(["units"] + [""] * (width - 1))
         writer.writerows(rows)
+
+
+def aircraft_database(root: Path, registrations: list[str]) -> Path:
+    path = root / "reg.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Registration", "A/C TYPE"])
+    for registration in registrations:
+        sheet.append([registration, "A319CFM"])
+    workbook.save(path)
+    workbook.close()
+    return path
 
 
 class QarAnalyzerTests(unittest.TestCase):
@@ -133,8 +154,8 @@ class QarAnalyzerTests(unittest.TestCase):
             folder = Path(temp)
             six = folder / "B-A_20260101010101___S1_E1_YZDCFM_CA0001.csv"
             seven = folder / "B-B_20260101010102___S1_E1_YZDCFM_CA0002.csv"
-            synthetic_cfm(six, 6, 0)
-            synthetic_cfm(seven, 7, 0)
+            synthetic_cfm(six, 7, 1)
+            synthetic_cfm(seven, 8, 1)
             self.assertFalse(
                 analyze_flight("P", six, AircraftType.CFM, threading.Event())
                 .metrics["cross_angle"].value
@@ -148,10 +169,10 @@ class QarAnalyzerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             person = Path(temp) / "人员"
             person.mkdir()
-            exact_twenty = person / "B-A_20260101010101_YZDCFM_CA0001.csv"
-            over_twenty = person / "B-B_20260101010102_YZDCFM_CA0002.csv"
-            synthetic_cfm(exact_twenty, aircraft_heading=20, runway_heading=0)
-            synthetic_cfm(over_twenty, aircraft_heading=21, runway_heading=0)
+            exact_twenty = person / "B-AAAA_20260101010101_YZDCFM_CA0001.csv"
+            over_twenty = person / "B-BBBB_20260101010102_YZDCFM_CA0002.csv"
+            synthetic_cfm(exact_twenty, aircraft_heading=21, runway_heading=1)
+            synthetic_cfm(over_twenty, aircraft_heading=22, runway_heading=1)
 
             exact_result = analyze_flight(
                 "人员", exact_twenty, AircraftType.CFM, threading.Event()
@@ -166,12 +187,14 @@ class QarAnalyzerTests(unittest.TestCase):
                 "人员", over_twenty, AircraftType.CFM, threading.Event()
             )
             self.assertEqual(invalid_result.angle_difference, 21)
-            self.assertFalse(invalid_result.metrics["cross_angle"].success)
+            self.assertTrue(invalid_result.metrics["cross_angle"].success)
+            self.assertFalse(invalid_result.metrics["cross_angle"].applicable)
             self.assertEqual(
                 invalid_result.metrics["cross_angle"].error_code,
                 "CROSS_ANGLE_OUT_OF_RANGE",
             )
-            self.assertFalse(invalid_result.metrics["reverse_rudder"].success)
+            self.assertTrue(invalid_result.metrics["reverse_rudder"].success)
+            self.assertFalse(invalid_result.metrics["reverse_rudder"].applicable)
             self.assertEqual(
                 invalid_result.metrics["reverse_rudder"].error_code,
                 "CROSS_ANGLE_OUT_OF_RANGE",
@@ -179,7 +202,7 @@ class QarAnalyzerTests(unittest.TestCase):
             self.assertTrue(invalid_result.metrics["rudder"].success)
             self.assertFalse(invalid_result.crosswind_metric.applicable)
 
-            result = analyze_selected_folder(temp)
+            result = analyze_selected_folder(temp, aircraft_database(Path(temp), ["B-AAAA", "B-BBBB"]))
             summary = result.summaries[0]
             self.assertEqual(summary.cross_angle_count, 1)
             self.assertEqual(summary.cross_angle_ratio, 1.0)
@@ -191,7 +214,7 @@ class QarAnalyzerTests(unittest.TestCase):
                     summary.stats["cross_angle"].triggered,
                     summary.stats["cross_angle"].failed,
                 ),
-                (2, 1, 1, 1),
+                (2, 1, 1, 0),
             )
             self.assertEqual(
                 (
@@ -200,8 +223,18 @@ class QarAnalyzerTests(unittest.TestCase):
                     summary.stats["reverse_rudder"].triggered,
                     summary.stats["reverse_rudder"].failed,
                 ),
-                (2, 1, 1, 1),
+                (2, 1, 1, 0),
             )
+            excluded_records = [
+                record
+                for record in result.log_records
+                if record.error_code == "CROSS_ANGLE_OUT_OF_RANGE"
+            ]
+            self.assertEqual(len(excluded_records), 2)
+            self.assertTrue(
+                all(record.status == "NOT_APPLICABLE" for record in excluded_records)
+            )
+            self.assertEqual(result.log_records[-1].status, "COMPLETED")
 
     def test_crosswind_direction_examples(self) -> None:
         self.assertAlmostEqual(calculate_crosswind(10, 90, 0), 10)
@@ -216,9 +249,9 @@ class QarAnalyzerTests(unittest.TestCase):
             path = Path(temp) / "B-TEST_20260101010101___S1_E1_YZDCFM_CA0001.csv"
             synthetic_cfm(
                 path,
-                aircraft_heading=10,
-                runway_heading=0,
-                wind_rows={2: (10, 90), 4: (20, 270)},
+                aircraft_heading=11,
+                runway_heading=1,
+                wind_rows={2: (10, 91), 4: (20, 271)},
             )
             result = analyze_flight("测试", path, AircraftType.CFM, threading.Event())
             self.assertTrue(result.crosswind_metric.success)
@@ -241,6 +274,19 @@ class QarAnalyzerTests(unittest.TestCase):
                 self.assertTrue(result.metrics["rudder"].success)
                 self.assertEqual(result.metrics["rudder"].value["reff"], 2)
                 self.assertEqual(result.metrics["rudder"].value["rall"], 4)
+
+    def test_dataframe_info_preamble_uses_second_row_as_header(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "B-X_20260101010101_YZDCFM_CA0001.csv"
+            synthetic_cfm(path, metadata_preamble=True)
+            result = analyze_flight(
+                "测试", path, AircraftType.CFM, threading.Event()
+            )
+            self.assertTrue(result.metrics["rudder"].success)
+            self.assertTrue(result.metrics["reverse_rudder"].success)
+            self.assertEqual(result.fifty_ft_row, 6)
+            self.assertEqual(result.touchdown_row, 7)
+            self.assertEqual(result.warnings, [])
 
     def test_rudder_uses_last_50ft_crossing_and_skips_invalid_height(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -290,13 +336,13 @@ class QarAnalyzerTests(unittest.TestCase):
                 left,
                 aircraft_heading=357,
                 runway_heading=1,
-                rudder_rows={2: [0, 0.8], 3: [0.8]},
+                rudder_rows={2: [0, 1.8], 3: [1.8]},
             )
             synthetic_cfm(
                 right,
                 aircraft_heading=5,
                 runway_heading=1,
-                rudder_rows={2: [-0.1]},
+                rudder_rows={2: [-1.1]},
             )
             synthetic_cfm(
                 exact_three,
@@ -322,7 +368,7 @@ class QarAnalyzerTests(unittest.TestCase):
             )
             self.assertEqual(left_result.signed_angle, -4)
             self.assertTrue(left_result.metrics["reverse_rudder"].value)
-            self.assertEqual(left_result.reverse_rudder_value, 0.8)
+            self.assertEqual(left_result.reverse_rudder_value, 1.8)
             self.assertEqual(left_result.reverse_rudder_row, 5)
             self.assertEqual(left_result.fifty_ft_row, 5)
 
@@ -331,7 +377,7 @@ class QarAnalyzerTests(unittest.TestCase):
             )
             self.assertEqual(right_result.signed_angle, 4)
             self.assertTrue(right_result.metrics["reverse_rudder"].value)
-            self.assertEqual(right_result.reverse_rudder_value, -0.1)
+            self.assertEqual(right_result.reverse_rudder_value, -1.1)
 
             exact_result = analyze_flight(
                 "测试", exact_three, AircraftType.CFM, threading.Event()
@@ -354,37 +400,72 @@ class QarAnalyzerTests(unittest.TestCase):
             person = Path(temp) / "人员"
             person.mkdir()
             synthetic_cfm(
-                person / "B-L_20260101010101_YZDCFM_CA0001.csv",
+                person / "B-LLLL_20260101010101_YZDCFM_CA0001.csv",
                 aircraft_heading=357,
                 runway_heading=1,
-                rudder_rows={2: [0.1, 0.2, 0.3], 3: [0.4]},
+                rudder_rows={2: [1.1, 1.2, 1.3], 3: [1.4]},
             )
             synthetic_cfm(
-                person / "B-N_20260101010102_YZDCFM_CA0002.csv",
+                person / "B-NNNN_20260101010102_YZDCFM_CA0002.csv",
                 aircraft_heading=358,
                 runway_heading=1,
                 rudder_rows={2: [20]},
             )
 
-            result = analyze_selected_folder(temp)
+            result = analyze_selected_folder(temp, aircraft_database(Path(temp), ["B-LLLL", "B-NNNN"]))
             self.assertEqual(result.summaries[0].reverse_rudder_count, 1)
             stats = result.summaries[0].stats["reverse_rudder"]
             self.assertEqual((stats.candidate, stats.valid, stats.triggered, stats.failed), (2, 2, 1, 0))
 
-    def test_no_valid_rudder_values_leave_ratio_empty(self) -> None:
+    def test_reverse_rudder_requires_manual_input_and_valid_runway_heading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            at_threshold = folder / "B-ONE1_20260101010101_YZDCFM_CA0001.csv"
+            manual = folder / "B-ONE2_20260101010102_YZDCFM_CA0002.csv"
+            constant = folder / "B-ONE3_20260101010103_YZDCFM_CA0003.csv"
+            zero = folder / "B-ONE4_20260101010104_YZDCFM_CA0004.csv"
+            synthetic_cfm(at_threshold, aircraft_heading=357, runway_heading=1, rudder_rows={2: [1, -1]})
+            synthetic_cfm(manual, aircraft_heading=357, runway_heading=1, rudder_rows={2: [1.01]})
+            synthetic_cfm(constant, aircraft_heading=357, runway_heading=1, rudder_rows={2: [16]}, constant_runway_heading=True)
+            synthetic_cfm(zero, aircraft_heading=4, runway_heading=0, rudder_rows={2: [-16]})
+
+            threshold_result = analyze_flight("测试", at_threshold, AircraftType.CFM, threading.Event())
+            self.assertTrue(threshold_result.metrics["reverse_rudder"].success)
+            self.assertFalse(threshold_result.metrics["reverse_rudder"].value)
+
+            manual_result = analyze_flight("测试", manual, AircraftType.CFM, threading.Event())
+            self.assertTrue(manual_result.metrics["reverse_rudder"].success)
+            self.assertTrue(manual_result.metrics["reverse_rudder"].value)
+            self.assertEqual(manual_result.reverse_rudder_value, 1.01)
+
+            constant_result = analyze_flight("测试", constant, AircraftType.CFM, threading.Event())
+            self.assertFalse(constant_result.metrics["cross_angle"].success)
+            self.assertEqual(constant_result.metrics["cross_angle"].error_code, "RUNWAY_HEADING_CONSTANT")
+            self.assertFalse(constant_result.metrics["reverse_rudder"].success)
+            self.assertEqual(constant_result.metrics["reverse_rudder"].error_code, "RUNWAY_HEADING_CONSTANT")
+            self.assertFalse(constant_result.crosswind_metric.applicable)
+
+            zero_result = analyze_flight("测试", zero, AircraftType.CFM, threading.Event())
+            self.assertFalse(zero_result.metrics["cross_angle"].success)
+            self.assertEqual(zero_result.metrics["cross_angle"].error_code, "RUNWAY_HEADING_ZERO")
+            self.assertFalse(zero_result.metrics["reverse_rudder"].success)
+            self.assertEqual(zero_result.metrics["reverse_rudder"].error_code, "RUNWAY_HEADING_ZERO")
+            self.assertFalse(zero_result.crosswind_metric.applicable)
+
+    def test_no_valid_rudder_values_write_zero_ratio(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             person = Path(temp) / "人员"
             person.mkdir()
-            path = person / "B-X_20260101010101_YZDCFM_CA0001.csv"
+            path = person / "B-XXXX_20260101010101_YZDCFM_CA0001.csv"
             synthetic_cfm(path, rudder_rows={})
 
-            result = analyze_selected_folder(temp)
+            result = analyze_selected_folder(temp, aircraft_database(Path(temp), ["B-XXXX"]))
             metric = result.flights[0].metrics["rudder"]
             self.assertFalse(metric.success)
             self.assertEqual(metric.error_code, "NO_RUDDER_VALUES")
             self.assertEqual(result.summaries[0].rudder_exceed_count, 0)
             self.assertEqual(result.summaries[0].rudder_valid_sample_count, 0)
-            self.assertIsNone(result.summaries[0].rudder_exceed_ratio)
+            self.assertEqual(result.summaries[0].rudder_exceed_ratio, 0.0)
             self.assertEqual(result.summaries[0].stats["rudder"].failed, 1)
             self.assertTrue(
                 any(
@@ -412,10 +493,10 @@ class QarAnalyzerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             person = Path(temp) / "人员"
             person.mkdir()
-            synthetic_cfm(person / "B-A_20260101010101___S1_E1_YZDCFM_CA0001.csv")
+            synthetic_cfm(person / "B-AAAA_20260101010101___S1_E1_YZDCFM_CA0001.csv")
             event = threading.Event()
             event.set()
-            result = analyze_selected_folder(temp, event)
+            result = analyze_selected_folder(temp, aircraft_database(Path(temp), ["B-AAAA"]), event)
             self.assertTrue(result.cancelled)
             self.assertEqual(result.flights, [])
 
@@ -425,18 +506,18 @@ class QarAnalyzerTests(unittest.TestCase):
             person = root / "input" / "甲"
             person.mkdir(parents=True)
             synthetic_cfm(
-                person / "B-A_20260101010101___S1_E1_YZDCFM_CA0001.csv",
-                aircraft_heading=10,
-                runway_heading=0,
+                person / "B-AAAA_20260101010101___S1_E1_YZDCFM_CA0001.csv",
+                aircraft_heading=11,
+                runway_heading=1,
                 pitch_rate=3.6,
                 baro_altitude=8001,
             )
-            result = analyze_selected_folder(root / "input")
+            result = analyze_selected_folder(root / "input", aircraft_database(root, ["B-AAAA"]))
 
             template = root / "template.xlsx"
             workbook = Workbook()
             sheet = workbook.active
-            for column in range(1, 13):
+            for column in range(1, 14):
                 sheet.cell(1, column, f"H{column}")
             workbook.save(template)
             workbook.close()
@@ -452,16 +533,21 @@ class QarAnalyzerTests(unittest.TestCase):
             saved = load_workbook(output, data_only=False)
             sheet = saved.active
             self.assertEqual(
-                [sheet.cell(1, column).value for column in range(1, 13)],
+                [sheet.cell(1, column).value for column in range(1, 14)],
                 WORKBOOK_HEADERS,
             )
             self.assertEqual(sheet.cell(2, 1).value, "甲")
-            self.assertEqual(sheet.cell(2, 4).value, 2)
-            self.assertEqual(sheet.cell(2, 5).value, 0.5)
-            self.assertEqual(sheet.cell(2, 5).number_format, "0.00%")
-            self.assertEqual(sheet.cell(2, 12).value, 1)
-            self.assertEqual(sheet.cell(2, 3).number_format, "0.00%")
+            self.assertEqual(sheet.cell(2, 2).value, "A319")
+            self.assertEqual(sheet.cell(2, 5).value, 2)
+            self.assertEqual(sheet.cell(2, 6).value, 0.5)
+            self.assertEqual(sheet.cell(2, 6).number_format, "0.00%")
+            self.assertEqual(sheet.cell(2, 13).value, 1)
+            self.assertEqual(sheet.cell(2, 4).number_format, "0.00%")
             self.assertTrue(sheet.cell(1, 1).alignment.wrap_text)
+            for row in sheet.iter_rows(min_row=1, max_row=2, min_col=1, max_col=13):
+                for cell in row:
+                    self.assertEqual(cell.alignment.horizontal, "center")
+                    self.assertEqual(cell.alignment.vertical, "center")
             self.assertGreaterEqual(sheet.row_dimensions[1].height or 0, 96)
             saved.close()
 
@@ -470,6 +556,17 @@ class QarAnalyzerTests(unittest.TestCase):
             self.assertTrue(report.name.startswith("qar_report_"))
             self.assertTrue(second_report.stem.endswith("_1"))
             document = Document(report)
+            hyperlink_targets = [
+                relationship.target_ref
+                for relationship in document.part.rels.values()
+                if relationship.reltype == RT.HYPERLINK
+            ]
+            self.assertEqual(len(hyperlink_targets), 1)
+            self.assertTrue(all(target.startswith(str(root.resolve())) for target in hyperlink_targets))
+            self.assertTrue(all("%20" not in target for target in hyperlink_targets))
+            self.assertTrue(all("B-AAAA_20260101010101" in target for target in hyperlink_targets))
+            hyperlink_nodes = document.element.xpath(".//w:hyperlink")
+            self.assertEqual(len(hyperlink_nodes), 3)
             paragraph_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
             table_text = "\n".join(
                 cell.text
@@ -503,7 +600,7 @@ class QarAnalyzerTests(unittest.TestCase):
 
     def test_cancelled_result_cannot_create_docx(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            result = analyze_selected_folder(temp, threading.Event())
+            result = analyze_selected_folder(temp, aircraft_database(Path(temp), []), threading.Event())
             result.cancelled = True
             with self.assertRaises(OutputError):
                 write_docx_report(Path(temp) / "result", result)

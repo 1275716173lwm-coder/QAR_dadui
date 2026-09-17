@@ -10,11 +10,31 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from openpyxl import load_workbook
+
 
 class AircraftType(str, Enum):
     CFM = "CFM"
     LEAP = "LEAP"
     PW = "PW"
+
+
+class AircraftCategory(str, Enum):
+    A319 = "A319"
+    A320_A321 = "A320、A321"
+    A321NEO = "A321NEO"
+
+
+SUPPORTED_AIRCRAFT: dict[str, tuple[AircraftType, AircraftCategory]] = {
+    "A319CFM": (AircraftType.CFM, AircraftCategory.A319),
+    "A319LEAP": (AircraftType.LEAP, AircraftCategory.A319),
+    "A320CFM": (AircraftType.CFM, AircraftCategory.A320_A321),
+    "A321CFM": (AircraftType.CFM, AircraftCategory.A320_A321),
+    "A320PW": (AircraftType.PW, AircraftCategory.A320_A321),
+    "A320LEAP": (AircraftType.LEAP, AircraftCategory.A320_A321),
+    "A321LEAP": (AircraftType.LEAP, AircraftCategory.A321NEO),
+    "A321PW": (AircraftType.PW, AircraftCategory.A321NEO),
+}
 
 
 class AnalysisCancelled(Exception):
@@ -74,6 +94,11 @@ class FlightResult:
     wind_source_row: int | None = None
     wind_row_offset: int | None = None
     warnings: list[str] = field(default_factory=list)
+    registration_raw: str = ""
+    registration: str = ""
+    database_aircraft_type: str = ""
+    aircraft_category: str = ""
+    validation_status: str = "VALID"
 
 
 @dataclass
@@ -82,11 +107,13 @@ class MetricStats:
     valid: int = 0
     triggered: int = 0
     failed: int = 0
+    skipped: int = 0
 
 
 @dataclass
 class PersonSummary:
     person: str
+    aircraft_category: str
     stick_exceed_count: int
     stick_exceed_ratio: float | None
     rudder_exceed_count: int
@@ -129,6 +156,13 @@ class LogRecord:
     fifty_ft_row: str = ""
     touchdown_row: str = ""
     reverse_rudder_triggered: str = ""
+    aircraft_database: str = ""
+    registration_raw: str = ""
+    registration: str = ""
+    database_aircraft_type: str = ""
+    aircraft_category: str = ""
+    filename_engine_marker: str = ""
+    skipped: str = ""
 
 
 @dataclass
@@ -144,12 +178,44 @@ class ProgressEvent:
 @dataclass
 class AnalysisResult:
     selected_folder: Path
+    aircraft_database: Path
     started_at: datetime
     ended_at: datetime
     summaries: list[PersonSummary]
     flights: list[FlightResult]
     log_records: list[LogRecord]
     cancelled: bool = False
+    preflight_failed: bool = False
+
+
+@dataclass
+class AircraftDatabaseLoadResult:
+    success: bool
+    path: Path
+    registrations: dict[str, str] = field(default_factory=dict)
+    error_code: str = ""
+    error_message: str = ""
+
+
+@dataclass
+class PreflightFileResult:
+    person: str
+    path: Path
+    aircraft_type: AircraftType
+    registration_raw: str = ""
+    registration: str = ""
+    database_aircraft_type: str = ""
+    aircraft_category: str = ""
+    status: str = "VALID"
+    error_code: str = ""
+    message: str = ""
+
+
+@dataclass
+class PreflightResult:
+    success: bool
+    files: list[PreflightFileResult]
+    blocking_files: list[PreflightFileResult] = field(default_factory=list)
 
 
 def _column_number(label: str) -> int:
@@ -221,6 +287,7 @@ METRIC_LABELS = {
 
 _TIME_PATTERN = re.compile(r"(?<!\d)(\d{14})(?!\d)")
 _FLIGHT_NUMBER_PATTERN = re.compile(r"CA\d+", re.IGNORECASE)
+_REGISTRATION_PATTERN = re.compile(r"B-[A-Z0-9]{4}", re.IGNORECASE)
 
 
 def parse_flight_time(name: str) -> datetime | None:
@@ -248,6 +315,88 @@ def identify_aircraft(name: str) -> AircraftType | None:
     upper_name = name.upper()
     matches = [kind for kind, config in CONFIGS.items() if config.marker in upper_name]
     return matches[0] if len(matches) == 1 else None
+
+
+def parse_registration(name: str) -> tuple[str, str] | None:
+    match = _REGISTRATION_PATTERN.search(name)
+    if match is None:
+        return None
+    raw = match.group(0)
+    return raw, raw.strip().upper()
+
+
+def load_aircraft_database(path: str | Path) -> AircraftDatabaseLoadResult:
+    database_path = Path(path).resolve()
+    if database_path.suffix.lower() != ".xlsx":
+        return AircraftDatabaseLoadResult(False, database_path, error_code="DATABASE_EXTENSION", error_message="飞机数据库必须是.xlsx文件")
+    try:
+        workbook = load_workbook(database_path, read_only=True, data_only=True)
+        sheet = workbook.active
+        rows = sheet.iter_rows(values_only=True)
+        header = next(rows, None)
+        if header is None:
+            raise ValueError("数据库为空")
+        normalized_headers = [str(value).strip() if value is not None else "" for value in header]
+        try:
+            registration_col = normalized_headers.index("Registration")
+            aircraft_col = normalized_headers.index("A/C TYPE")
+        except ValueError as exc:
+            raise ValueError("数据库必须包含 Registration 和 A/C TYPE 列") from exc
+        registrations: dict[str, str] = {}
+        conflicts: set[str] = set()
+        for row in rows:
+            raw_registration = row[registration_col] if registration_col < len(row) else None
+            raw_type = row[aircraft_col] if aircraft_col < len(row) else None
+            if raw_registration is None or not str(raw_registration).strip():
+                continue
+            registration = str(raw_registration).strip().upper()
+            aircraft_type = "" if raw_type is None else str(raw_type).strip().upper()
+            previous = registrations.get(registration)
+            if previous is not None and previous != aircraft_type:
+                conflicts.add(registration)
+            registrations[registration] = aircraft_type
+        workbook.close()
+        if conflicts:
+            names = "、".join(sorted(conflicts))
+            raise ValueError(f"重复注册号对应不同机型：{names}")
+        return AircraftDatabaseLoadResult(True, database_path, registrations)
+    except Exception as exc:
+        return AircraftDatabaseLoadResult(False, database_path, error_code="DATABASE_READ_ERROR", error_message=str(exc))
+
+
+def preflight_candidates(
+    people: list[tuple[Path, list[tuple[Path, AircraftType]]]],
+    database: AircraftDatabaseLoadResult,
+) -> PreflightResult:
+    results: list[PreflightFileResult] = []
+    blocking: list[PreflightFileResult] = []
+    if not database.success:
+        return PreflightResult(False, results)
+    for person_dir, files in people:
+        for path, filename_engine in files:
+            parsed = parse_registration(path.name)
+            if parsed is None:
+                item = PreflightFileResult(person_dir.name, path, filename_engine, status="BLOCKED", error_code="REGISTRATION_MISSING", message="文件名中缺少符合B-[A-Z0-9]{4}的注册号")
+                results.append(item)
+                blocking.append(item)
+                continue
+            raw, registration = parsed
+            database_type = database.registrations.get(registration)
+            if database_type is None:
+                item = PreflightFileResult(person_dir.name, path, filename_engine, raw, registration, status="BLOCKED", error_code="REGISTRATION_NOT_FOUND", message="注册号未在飞机数据库中找到")
+                results.append(item)
+                blocking.append(item)
+                continue
+            mapping = SUPPORTED_AIRCRAFT.get(database_type)
+            if mapping is None:
+                results.append(PreflightFileResult(person_dir.name, path, filename_engine, raw, registration, database_type, status="SKIPPED", error_code="AIRCRAFT_TYPE_UNSUPPORTED", message="数据库具体机型不属于支持的8种机型"))
+                continue
+            expected_engine, category = mapping
+            if expected_engine != filename_engine:
+                results.append(PreflightFileResult(person_dir.name, path, filename_engine, raw, registration, database_type, category.value, "SKIPPED", "ENGINE_MARKER_CONFLICT", f"数据库发动机={expected_engine.value}，文件名发动机={filename_engine.value}"))
+                continue
+            results.append(PreflightFileResult(person_dir.name, path, filename_engine, raw, registration, database_type, category.value))
+    return PreflightResult(not blocking, results, blocking)
 
 
 def discover_people(selected_folder: Path) -> list[tuple[Path, list[tuple[Path, AircraftType]]]]:
@@ -367,6 +516,7 @@ def analyze_flight(
     touchdown_aircraft_heading: float | None = None
     touchdown_runway_heading: float | None = None
     last_runway_heading: float | None = None
+    runway_heading_values: set[float] = set()
     last_wind_at_or_before: tuple[int, int, float, float] | None = None
     first_wind_after: tuple[int, int, float, float] | None = None
     landing_needs_wind = False
@@ -383,9 +533,21 @@ def analyze_flight(
         with path.open("r", encoding=encoding, newline="") as handle:
             reader = csv.reader(handle)
             try:
-                header = next(reader)
+                first_row = next(reader)
             except StopIteration:
                 raise ValueError("CSV为空文件")
+            data_start_csv_row = 3
+            if (
+                first_row
+                and first_row[0].strip().lower().startswith("dataframe info")
+            ):
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    raise ValueError("CSV包含元数据行，但缺少字段名行")
+                data_start_csv_row = 4
+            else:
+                header = first_row
             try:
                 next(reader)  # units row
             except StopIteration:
@@ -397,7 +559,7 @@ def analyze_flight(
             rudder_columns_available = expected_width > config.rudder_cols[1]
 
             for data_index, row in enumerate(reader):
-                csv_row = data_index + 3
+                csv_row = data_index + data_start_csv_row
                 if data_index % 250 == 0 and cancel_event.is_set():
                     raise AnalysisCancelled
 
@@ -407,6 +569,8 @@ def analyze_flight(
                     long_rows += 1
 
                 runway_value = _finite_number(_cell(row, config.runway_heading_col))
+                if runway_value is not None:
+                    runway_heading_values.add(runway_value % 360)
                 if touchdown_data_index is None and runway_value is not None:
                     last_runway_heading = runway_value
 
@@ -499,6 +663,7 @@ def analyze_flight(
                     and takeoff_data_index is not None
                     and pitch_rows_remaining == 0
                     and wind_search_complete
+                    and len(runway_heading_values) >= 2
                 ):
                     break
     except AnalysisCancelled:
@@ -631,7 +796,27 @@ def analyze_flight(
                         },
                     )
 
-        if touchdown_aircraft_heading is None:
+        runway_heading_is_zero = (
+            touchdown_runway_heading is not None
+            and abs(touchdown_runway_heading % 360) < 1e-12
+        )
+        runway_heading_is_constant = (
+            touchdown_runway_heading is not None and len(runway_heading_values) == 1
+        )
+
+        if runway_heading_is_zero:
+            metrics["cross_angle"] = MetricResult(
+                False,
+                error_code="RUNWAY_HEADING_ZERO",
+                error_message="跑道磁航向为0，判定为数据错误，不进行接地交叉角判断",
+            )
+        elif runway_heading_is_constant:
+            metrics["cross_angle"] = MetricResult(
+                False,
+                error_code="RUNWAY_HEADING_CONSTANT",
+                error_message="跑道磁航向列的有效数值始终保持不变，判定为数据错误，不进行接地交叉角判断",
+            )
+        elif touchdown_aircraft_heading is None:
             metrics["cross_angle"] = MetricResult(
                 False, error_code="NO_AIRCRAFT_HEADING", error_message="接地行飞机磁航向无有效值"
             )
@@ -646,23 +831,40 @@ def analyze_flight(
             angle_difference = abs(signed_angle)
             if angle_difference > 20:
                 metrics["cross_angle"] = MetricResult(
-                    False,
+                    True,
+                    value=None,
                     error_code="CROSS_ANGLE_OUT_OF_RANGE",
                     error_message=(
-                        f"接地交叉角{angle_difference:.2f}°严格大于20°，判定为错误数据"
+                        f"接地交叉角{angle_difference:.2f}°严格大于20°，"
+                        "仅记录日志并排除接地交叉角判断"
                     ),
+                    applicable=False,
                 )
             else:
                 metrics["cross_angle"] = MetricResult(True, angle_difference > 6)
 
-        if angle_difference is not None and angle_difference > 20:
+        if runway_heading_is_zero:
             metrics["reverse_rudder"] = MetricResult(
                 False,
+                error_code="RUNWAY_HEADING_ZERO",
+                error_message="跑道磁航向为0，判定为数据错误，不进行反向蹬舵判断",
+            )
+        elif runway_heading_is_constant:
+            metrics["reverse_rudder"] = MetricResult(
+                False,
+                error_code="RUNWAY_HEADING_CONSTANT",
+                error_message="跑道磁航向列的有效数值始终保持不变，判定为数据错误，不进行反向蹬舵判断",
+            )
+        elif angle_difference is not None and angle_difference > 20:
+            metrics["reverse_rudder"] = MetricResult(
+                True,
+                value=None,
                 error_code="CROSS_ANGLE_OUT_OF_RANGE",
                 error_message=(
                     f"接地交叉角{angle_difference:.2f}°严格大于20°，"
-                    "判定为错误数据，不进行反向蹬舵判断"
+                    "仅记录日志，不进行反向蹬舵判断"
                 ),
+                applicable=False,
             )
         elif not rudder_columns_available:
             metrics["reverse_rudder"] = MetricResult(
@@ -704,7 +906,7 @@ def analyze_flight(
                 matching_samples = [
                     (csv_row, value)
                     for csv_row, value in rudder_region_samples
-                    if signed_angle * value < 0
+                    if abs(value) > 1 and signed_angle * value < 0
                 ]
             if matching_samples:
                 reverse_rudder_row, reverse_rudder_value = matching_samples[0]
@@ -827,7 +1029,7 @@ def analyze_flight(
     )
 
 
-def _summarize_person(person: str, flights: Iterable[FlightResult]) -> PersonSummary:
+def _summarize_person(person: str, aircraft_category: str, flights: Iterable[FlightResult]) -> PersonSummary:
     flight_list = list(flights)
     stats = {key: MetricStats() for key in METRIC_LABELS}
     stick_exceed = 0
@@ -840,6 +1042,8 @@ def _summarize_person(person: str, flights: Iterable[FlightResult]) -> PersonSum
             metric = flight.metrics[key]
             item = stats[key]
             item.candidate += 1
+            if not metric.applicable:
+                continue
             if metric.success:
                 item.valid += 1
                 if key in ("stick", "rudder"):
@@ -876,17 +1080,18 @@ def _summarize_person(person: str, flights: Iterable[FlightResult]) -> PersonSum
     high = stats["high_altitude"]
     return PersonSummary(
         person=person,
+        aircraft_category=aircraft_category,
         stick_exceed_count=stick_exceed,
-        stick_exceed_ratio=(stick_exceed / stick_total) if stick_total else None,
+        stick_exceed_ratio=(stick_exceed / stick_total) if stick_total else 0.0,
         rudder_exceed_count=rudder_exceed,
         rudder_valid_sample_count=rudder_total,
-        rudder_exceed_ratio=(rudder_exceed / rudder_total) if rudder_total else None,
+        rudder_exceed_ratio=(rudder_exceed / rudder_total) if rudder_total else 0.0,
         cross_angle_count=cross.triggered,
-        cross_angle_ratio=(cross.triggered / cross.valid) if cross.valid else None,
+        cross_angle_ratio=(cross.triggered / cross.valid) if cross.valid else 0.0,
         pitch_rate_count=pitch.triggered,
-        pitch_rate_ratio=(pitch.triggered / pitch.valid) if pitch.valid else None,
+        pitch_rate_ratio=(pitch.triggered / pitch.valid) if pitch.valid else 0.0,
         high_altitude_count=high.triggered,
-        high_altitude_ratio=(high.triggered / high.valid) if high.valid else None,
+        high_altitude_ratio=(high.triggered / high.valid) if high.valid else 0.0,
         reverse_rudder_count=stats["reverse_rudder"].triggered,
         stats=stats,
     )
@@ -963,6 +1168,11 @@ def _metric_log_record(flight: FlightResult, key: str, metric: MetricResult) -> 
         reverse_rudder_triggered=(
             str(bool(metric.value)) if key == "reverse_rudder" and metric.success else ""
         ),
+        registration_raw=flight.registration_raw,
+        registration=flight.registration,
+        database_aircraft_type=flight.database_aircraft_type,
+        aircraft_category=flight.aircraft_category,
+        filename_engine_marker=CONFIGS[flight.aircraft_type].marker,
     )
 
 
@@ -996,15 +1206,22 @@ def _crosswind_log_record(flight: FlightResult) -> LogRecord:
             if flight.crosswind is not None
             else ""
         ),
+        registration_raw=flight.registration_raw,
+        registration=flight.registration,
+        database_aircraft_type=flight.database_aircraft_type,
+        aircraft_category=flight.aircraft_category,
+        filename_engine_marker=CONFIGS[flight.aircraft_type].marker,
     )
 
 
 def analyze_selected_folder(
     path: str | Path,
+    aircraft_database_path: str | Path,
     cancel_event: threading.Event | None = None,
     progress_callback: Callable[[ProgressEvent], None] | None = None,
 ) -> AnalysisResult:
     selected_folder = Path(path).resolve()
+    database_path = Path(aircraft_database_path).resolve()
     cancel_event = cancel_event or threading.Event()
     callback = progress_callback or (lambda event: None)
     started_at = datetime.now()
@@ -1013,7 +1230,8 @@ def analyze_selected_folder(
             record_type="RUN",
             timestamp=started_at,
             status="STARTED",
-            message=f"所选数据目录={selected_folder}",
+            message=f"所选数据目录={selected_folder}；飞机数据库={database_path}",
+            aircraft_database=str(database_path),
         )
     ]
     people = discover_people(selected_folder)
@@ -1023,26 +1241,63 @@ def analyze_selected_folder(
     summaries: list[PersonSummary] = []
     cancelled = False
 
-    callback(ProgressEvent("started", total=total_files, message=f"发现{len(people)}名人员、{total_files}个数据文件"))
-    for person_dir, files in people:
+    callback(ProgressEvent("database", total=total_files, message="正在读取飞机数据库"))
+    database = load_aircraft_database(database_path)
+    if not database.success:
+        ended_at = datetime.now()
+        log_records.append(LogRecord(record_type="PREFLIGHT", timestamp=ended_at, status="FAILED", error_code=database.error_code, message=f"{database.error_message}；未执行指标分析，未生成Excel和DOCX", aircraft_database=str(database_path)))
+        callback(ProgressEvent("preflight_failed", total=total_files, message=f"飞机数据库预检失败：{database.error_message}"))
+        return AnalysisResult(selected_folder, database_path, started_at, ended_at, [], [], log_records, preflight_failed=True)
+
+    callback(ProgressEvent("preflight", total=total_files, message="正在进行注册号预检"))
+    preflight = preflight_candidates(people, database)
+    for item in preflight.files:
+        if item.status != "VALID":
+            log_records.append(LogRecord(
+                record_type="PREFLIGHT", timestamp=datetime.now(), person=item.person,
+                file_path=str(item.path), aircraft_type=item.aircraft_type.value,
+                status=item.status, error_code=item.error_code, message=item.message,
+                aircraft_database=str(database_path), registration_raw=item.registration_raw,
+                registration=item.registration, database_aircraft_type=item.database_aircraft_type,
+                aircraft_category=item.aircraft_category,
+                filename_engine_marker=CONFIGS[item.aircraft_type].marker,
+                skipped="1" if item.status == "SKIPPED" else "0",
+            ))
+    if not preflight.success:
+        ended_at = datetime.now()
+        log_records.append(LogRecord(record_type="PREFLIGHT", timestamp=ended_at, status="FAILED", error_code="PREFLIGHT_BLOCKED", message="注册号预检失败；未执行指标分析，未生成Excel和DOCX", aircraft_database=str(database_path)))
+        callback(ProgressEvent("preflight_failed", total=total_files, message=f"注册号预检失败：共{len(preflight.blocking_files)}个文件无法匹配"))
+        return AnalysisResult(selected_folder, database_path, started_at, ended_at, [], [], log_records, preflight_failed=True)
+
+    valid_by_person: dict[str, list[PreflightFileResult]] = {}
+    for item in preflight.files:
+        if item.status == "VALID":
+            valid_by_person.setdefault(item.person, []).append(item)
+    valid_count = sum(len(items) for items in valid_by_person.values())
+    callback(ProgressEvent("started", total=valid_count, message=f"预检通过，发现{len(valid_by_person)}名人员、{valid_count}个有效数据文件"))
+    for person_dir, _ in people:
+        files = valid_by_person.get(person_dir.name, [])
+        if not files:
+            continue
         if cancel_event.is_set():
             cancelled = True
             break
         callback(
             ProgressEvent(
-                "person", person=person_dir.name, completed=completed_files, total=total_files,
+                "person", person=person_dir.name, completed=completed_files, total=valid_count,
                 message=f"开始分析人员：{person_dir.name}",
             )
         )
-        person_flights: list[FlightResult] = []
-        for file_path, aircraft_type in files:
+        category_flights: dict[str, list[FlightResult]] = {}
+        for item in files:
+            file_path, aircraft_type = item.path, item.aircraft_type
             if cancel_event.is_set():
                 cancelled = True
                 break
             callback(
                 ProgressEvent(
                     "file", person=person_dir.name, file_name=file_path.name,
-                    completed=completed_files, total=total_files, message=f"正在分析：{file_path.name}",
+                    completed=completed_files, total=valid_count, message=f"正在分析：{file_path.name}",
                 )
             )
             try:
@@ -1050,7 +1305,11 @@ def analyze_selected_folder(
             except AnalysisCancelled:
                 cancelled = True
                 break
-            person_flights.append(flight)
+            flight.registration_raw = item.registration_raw
+            flight.registration = item.registration
+            flight.database_aircraft_type = item.database_aircraft_type
+            flight.aircraft_category = item.aircraft_category
+            category_flights.setdefault(item.aircraft_category, []).append(flight)
             all_flights.append(flight)
             for key, metric in flight.metrics.items():
                 log_records.append(_metric_log_record(flight, key, metric))
@@ -1095,14 +1354,24 @@ def analyze_selected_folder(
             callback(
                 ProgressEvent(
                     "progress", person=person_dir.name, file_name=file_path.name,
-                    completed=completed_files, total=total_files, message=f"已完成：{file_path.name}",
+                    completed=completed_files, total=valid_count, message=f"已完成：{file_path.name}",
                 )
             )
-        summaries.append(_summarize_person(person_dir.name, person_flights))
+        for category in (AircraftCategory.A319.value, AircraftCategory.A320_A321.value, AircraftCategory.A321NEO.value):
+            if category in category_flights:
+                summaries.append(_summarize_person(person_dir.name, category, category_flights[category]))
         if cancelled:
             break
 
     for summary in summaries:
+        skipped_for_group = sum(
+            1 for item in preflight.files
+            if item.status == "SKIPPED"
+            and item.person == summary.person
+            and item.aircraft_category == summary.aircraft_category
+        )
+        for stat in summary.stats.values():
+            stat.skipped = skipped_for_group
         for key, item in summary.stats.items():
             summary_message = ""
             if key == "rudder":
@@ -1117,9 +1386,28 @@ def analyze_selected_folder(
                     record_type="SUMMARY", timestamp=datetime.now(), person=summary.person,
                     metric=METRIC_LABELS[key], status="SUMMARY", candidate=str(item.candidate),
                     valid=str(item.valid), triggered=str(item.triggered), failed=str(item.failed),
-                    message=summary_message,
+                    skipped=str(item.skipped), message=summary_message,
+                    aircraft_database=str(database_path), aircraft_category=summary.aircraft_category,
                 )
             )
+
+    summarized_groups = {(summary.person, summary.aircraft_category) for summary in summaries}
+    skipped_groups: dict[tuple[str, str], int] = {}
+    for item in preflight.files:
+        if item.status == "SKIPPED" and item.aircraft_category:
+            key = (item.person, item.aircraft_category)
+            skipped_groups[key] = skipped_groups.get(key, 0) + 1
+    for (person, category), skipped_count in skipped_groups.items():
+        if (person, category) in summarized_groups:
+            continue
+        for key, label in METRIC_LABELS.items():
+            log_records.append(LogRecord(
+                record_type="SUMMARY", timestamp=datetime.now(), person=person,
+                aircraft_category=category, metric=label, status="SUMMARY",
+                candidate="0", valid="0", triggered="0", failed="0",
+                skipped=str(skipped_count), aircraft_database=str(database_path),
+                message="本人员及机型分类仅有预检跳过文件，未生成输出行",
+            ))
 
     ended_at = datetime.now()
     failed_count = sum(1 for record in log_records if record.status == "FAILED")
@@ -1137,12 +1425,13 @@ def analyze_selected_folder(
         ProgressEvent(
             "cancelled" if cancelled else "analyzed",
             completed=completed_files,
-            total=total_files,
+            total=valid_count,
             message=message,
         )
     )
     return AnalysisResult(
         selected_folder=selected_folder,
+        aircraft_database=database_path,
         started_at=started_at,
         ended_at=ended_at,
         summaries=summaries,
